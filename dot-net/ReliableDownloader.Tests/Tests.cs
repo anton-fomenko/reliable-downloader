@@ -205,9 +205,115 @@ public class Tests
         Assert.That(File.Exists(_testFilePath) == false, "File should not exist after failed download.");
     }
 
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenFullDownloadThrowsNetworkError()
+    {
+        // Arrange
+        var url = "http://full-download-network-error.com/file.msi";
+        long fileSize = 1024;
+
+        // Mock Headers response
+        var headersResponse = new HttpResponseMessage(HttpStatusCode.OK);
+        headersResponse.Content = new ByteArrayContent(Array.Empty<byte>());
+        headersResponse.Content.Headers.ContentLength = fileSize;
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                    .ReturnsAsync(headersResponse);
+
+        // Mock Content call to throw exception
+        _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                     .ThrowsAsync(new HttpRequestException("Network error during download"));
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result == false); // Corrected Assert
+        _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
+        Assert.That(File.Exists(_testFilePath) == false, "File should not exist after exception during download.");
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenCancelledDuringFullDownload()
+    {
+        // Arrange
+        var url = "http://cancel-during-full.com/file.msi";
+        long fileSize = 500000; // Larger size to allow time for cancellation
+        string fileContent = new string('A', (int)fileSize);
+        var fileBytes = Encoding.UTF8.GetBytes(fileContent);
+
+        // Mock Headers response
+        var headersResponse = new HttpResponseMessage(HttpStatusCode.OK);
+        headersResponse.Content = new ByteArrayContent(Array.Empty<byte>());
+        headersResponse.Content.Headers.ContentLength = fileSize;
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(headersResponse);
+
+        // Mock Content response - Use a stream that respects cancellation
+        var tcs = new TaskCompletionSource<HttpResponseMessage>(); // Allows controlling when the response is available
+        _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                     .Returns(async () => {
+                         // Simulate delay before response is ready
+                         await Task.Delay(50, _cts.Token); // Short delay
+                         var response = new HttpResponseMessage(HttpStatusCode.OK);
+                         // Simulate a slow stream read that gets cancelled
+                         response.Content = new StreamContent(new SlowStream(fileBytes, 100 /*ms delay per chunk*/, _cts.Token));
+                         response.Content.Headers.ContentLength = fileSize;
+                         return response;
+                     });
+
+        // Act
+        var downloadTask = _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Cancel shortly after starting
+        await Task.Delay(100); // Wait a bit for download to start reading
+        _cts.Cancel();
+
+        var result = await downloadTask;
+
+        // Assert
+        Assert.That(result == false);
+        Assert.That(_cts.IsCancellationRequested);
+        _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.AtMostOnce());
+        Assert.That(!File.Exists(_testFilePath), "File should be deleted after cancellation during download.");
+        Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0 || _progressUpdates.Count == 0,
+            "Progress should not reach 100% if cancelled during copy");
+    }
+
     private void HandleProgress(FileProgress progress)
     {
         _progressUpdates.Add(progress);
         Console.WriteLine($"Progress: {progress}");
+    }
+
+    // Helper stream to simulate slow download and cancellation check
+    private class SlowStream : MemoryStream
+    {
+        private readonly int _delayMs;
+        private readonly CancellationToken _token;
+
+        public SlowStream(byte[] buffer, int delayMs, CancellationToken token) : base(buffer)
+        {
+            _delayMs = delayMs;
+            _token = token;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            // Combine internal token and method token
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_token, cancellationToken);
+
+            await Task.Delay(_delayMs, linkedCts.Token); // Simulate network latency
+            linkedCts.Token.ThrowIfCancellationRequested(); // Check for cancellation
+            return await base.ReadAsync(buffer, offset, count, linkedCts.Token);
+        }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            // Combine internal token and method token
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_token, cancellationToken);
+
+            await Task.Delay(_delayMs, linkedCts.Token); // Simulate network latency
+            linkedCts.Token.ThrowIfCancellationRequested(); // Check for cancellation
+            return await base.ReadAsync(buffer, linkedCts.Token);
+        }
     }
 }
