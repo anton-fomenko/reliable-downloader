@@ -16,7 +16,7 @@ if (args.Length > 2)
     cts.CancelAfter(TimeSpan.FromMilliseconds(int.Parse(args[2])));
 }
 
-var fileDownloader = new FileDownloader();
+var fileDownloader = new FileDownloader(new WebSystemCalls());
 
 var didDownloadSuccessfully = await fileDownloader.TryDownloadFile(
     exampleUrl,
