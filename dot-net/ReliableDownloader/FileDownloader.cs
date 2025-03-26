@@ -3,6 +3,7 @@
 internal sealed class FileDownloader : IFileDownloader
 {
     private readonly IWebSystemCalls _webSystemCalls;
+    private const int BufferSize = 81920; // 80 KB buffer for copying streams
 
     public FileDownloader(IWebSystemCalls webSystemCalls)
     {
@@ -45,14 +46,69 @@ internal sealed class FileDownloader : IFileDownloader
                 return false;
             }
 
+            long totalBytesDownloaded = 0;
+            // Report initial progress
+            ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time later
 
-            // --- Placeholder for next steps ---
-            Console.WriteLine("Header check successful. Download logic to be implemented.");
+            if (!partialDownloadSupported)
+            {
+                Console.WriteLine("Partial download not supported. Attempting full download.");
+                try
+                {
+                    using var contentResponse = await _webSystemCalls.DownloadContentAsync(contentFileUrl, cancellationToken).ConfigureAwait(false);
 
+                    if (!contentResponse.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Failed to download content. Status code: {contentResponse.StatusCode}");
+                        return false; // Add retry later
+                    }
 
-            // For now, just return false as download isn't implemented
-            return false;
+                    Console.WriteLine($"Writing to file: {localFilePath}");
+                    using var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
+                    using var contentStream = await contentResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
 
+                    var buffer = new byte[BufferSize];
+                    int bytesRead;
+                    while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+                    {
+                        await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                        totalBytesDownloaded += bytesRead;
+
+                        // Report progress during copy
+                        ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time
+                    }
+
+                    Console.WriteLine("Full download completed and file written.");
+                    // TODO: Add integrity check here in a later step
+                    return true; // Success for now
+
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Network error during full download: {ex.Message}");
+                    return false; // Add retry later
+                }
+                catch (IOException ex)
+                {
+                    Console.WriteLine($"File system error during full download: {ex.Message}");
+                    // Attempt to delete potentially corrupted file
+                    TryDeleteFile(localFilePath);
+                    return false;
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine("Operation cancelled during full download.");
+                    // Attempt to delete potentially incomplete file
+                    TryDeleteFile(localFilePath);
+                    return false;
+                }
+            }
+            else
+            {
+                // --- Placeholder for Partial Download Logic (Next Step) ---
+                Console.WriteLine("Partial download. Logic to be implemented.");
+                return false; // Not implemented yet
+            }
         }
         catch (HttpRequestException ex)
         {
@@ -69,6 +125,38 @@ internal sealed class FileDownloader : IFileDownloader
         {
             Console.WriteLine($"An unexpected error occurred: {ex.Message}");
             return false;
+        }
+    }
+
+    private void ReportProgress(Action<FileProgress> onProgressChanged, long totalFileSize, long totalBytesDownloaded, TimeSpan estimatedRemaining)
+    {
+        double? progressPercent = null;
+        if (totalFileSize > 0)
+        {
+            // Ensure percentage is between 0 and 100
+            progressPercent = Math.Max(0.0, Math.Min(100.0, (double)totalBytesDownloaded / totalFileSize * 100.0));
+        }
+        onProgressChanged?.Invoke(new FileProgress(totalFileSize, totalBytesDownloaded, progressPercent, estimatedRemaining));
+    }
+
+    // Helper to attempt file deletion without throwing exceptions
+    private void TryDeleteFile(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                Console.WriteLine($"Attempting to delete incomplete/corrupt file: {filePath}");
+                File.Delete(filePath);
+            }
+        }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"Warning: Could not delete file '{filePath}': {ex.Message}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"Warning: No permission to delete file '{filePath}': {ex.Message}");
         }
     }
 }
