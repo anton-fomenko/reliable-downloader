@@ -1,9 +1,12 @@
-﻿namespace ReliableDownloader;
+﻿using System.Net;
+
+namespace ReliableDownloader;
 
 internal sealed class FileDownloader : IFileDownloader
 {
     private readonly IWebSystemCalls _webSystemCalls;
     private const int BufferSize = 81920; // 80 KB buffer for copying streams
+    private const long DefaultChunkSize = 1 * 1024 * 1024; // 1MB chunks for partial download
 
     public FileDownloader(IWebSystemCalls webSystemCalls)
     {
@@ -118,9 +121,95 @@ internal sealed class FileDownloader : IFileDownloader
             }
             else
             {
-                // --- Placeholder for Partial Download Logic (Next Step) ---
-                Console.WriteLine("Partial download. Logic to be implemented.");
-                return false; // Not implemented yet
+                Console.WriteLine("Partial download. Downloading in chunks.");
+                using var fileStream = new FileStream(localFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None);
+
+                while (totalBytesDownloaded < totalFileSize)
+                {
+                    cancellationToken.ThrowIfCancellationRequested(); // Check for cancellation before each chunk
+
+                    long bytesRemaining = totalFileSize.Value - totalBytesDownloaded;
+                    long bytesToDownload = Math.Min(bytesRemaining, DefaultChunkSize);
+                    long rangeFrom = totalBytesDownloaded;
+                    long rangeTo = rangeFrom + bytesToDownload - 1;
+
+                    Console.WriteLine($"Requesting bytes {rangeFrom}-{rangeTo}");
+
+                    try
+                    {
+                        // Ensure stream is positioned correctly for writing/appending
+                        fileStream.Seek(rangeFrom, SeekOrigin.Begin);
+
+                        using var partialResponse = await _webSystemCalls.DownloadPartialContentAsync(contentFileUrl, rangeFrom, rangeTo, cancellationToken).ConfigureAwait(false);
+
+                        if (partialResponse.StatusCode == HttpStatusCode.PartialContent) // 206
+                        {
+                            using var partialContentStream = await partialResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                            var buffer = new byte[BufferSize];
+                            int bytesRead;
+                            while ((bytesRead = await partialContentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+                            {
+                                await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                                totalBytesDownloaded += bytesRead;
+                                // Report progress within chunk copy
+                                ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time
+                            }
+                            // Ensure stream buffers are flushed to disk
+                            await fileStream.FlushAsync(cancellationToken);
+                        }
+                        else if (partialResponse.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) // 416
+                        {
+                            Console.WriteLine($"Server returned 416 Range Not Satisfiable. Assuming download already complete at {totalBytesDownloaded} bytes.");
+                            // Verify against total size again
+                            if (totalBytesDownloaded >= totalFileSize) break; // Exit loop if complete
+                            else
+                            {
+                                // Something unexpected happened. Maybe server issue or incorrect local size?
+                                Console.WriteLine("Error: Received 416 but local size doesn't match total size. Aborting.");
+                                return false; // Or attempt retry/full download? Needs strategy.
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Failed to download chunk. Status code: {partialResponse.StatusCode}");
+                            // TODO: Implement retry logic here for transient errors
+                            return false; // Fail for now
+                        }
+                    }
+                    catch (HttpRequestException ex)
+                    {
+                        Console.WriteLine($"Network error downloading chunk: {ex.Message}");
+                        // TODO: Implement retry logic here
+                        return false; // Fail for now
+                    }
+                    catch (IOException ex)
+                    {
+                        Console.WriteLine($"File system error during partial download: {ex.Message}");
+                        return false; // Likely non-recoverable by simple retry
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Console.WriteLine("Operation cancelled during partial download.");
+                        // Don't delete the partial file here, as resuming is the point
+                        return false;
+                    }
+                    // Small delay between chunks. Can prevent overwhelming server/network
+                    await Task.Delay(50, cancellationToken);
+                } 
+
+                // Final check after loop
+                if (totalBytesDownloaded == totalFileSize)
+                {
+                    Console.WriteLine("Partial download completed successfully.");
+                    // TODO: Add integrity check here
+                    return true;
+                }
+                else
+                {
+                    Console.WriteLine($"Download ended unexpectedly. Bytes downloaded: {totalBytesDownloaded}, Total size: {totalFileSize}");
+                    return false;
+                }
+                // --- End Partial Download Logic ---
             }
         }
         catch (HttpRequestException ex)
