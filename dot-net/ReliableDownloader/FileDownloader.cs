@@ -47,58 +47,71 @@ internal sealed class FileDownloader : IFileDownloader
             }
 
             long totalBytesDownloaded = 0;
+
+            // Check existing file size for resuming
+            if (File.Exists(localFilePath))
+            {
+                try
+                {
+                    totalBytesDownloaded = new FileInfo(localFilePath).Length;
+                    Console.WriteLine($"Existing file found with size: {totalBytesDownloaded} bytes.");
+
+                    // If local file is bigger than or equal to server file, assume complete (or corrupt)
+                    if (totalBytesDownloaded >= totalFileSize)
+                    {
+                        // If sizes match exactly, assume done. Could add integrity check here later.
+                        if (totalBytesDownloaded == totalFileSize)
+                        {
+                            Console.WriteLine("Existing file size matches total file size. Assuming download complete.");
+                            ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero);
+                            // TODO: Add integrity check here even for existing file
+                            return true;
+                        }
+                        else
+                        {
+                            // Local file is larger - something is wrong. Delete and start over.
+                            Console.WriteLine($"Existing file size ({totalBytesDownloaded}) is larger than total size ({totalFileSize}). Deleting and restarting.");
+                            TryDeleteFile(localFilePath);
+                            totalBytesDownloaded = 0;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Resuming download from byte {totalBytesDownloaded}.");
+                    }
+                }
+                catch (IOException ex)
+                {
+                    Console.WriteLine($"Error accessing existing file '{localFilePath}': {ex.Message}. Attempting to restart download.");
+                    TryDeleteFile(localFilePath);
+                    totalBytesDownloaded = 0;
+                }
+            }
+
             // Report initial progress
             ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time later
 
             if (!partialDownloadSupported)
             {
+                // ... (ensure totalBytesDownloaded is 0 if full download needed) ...
+                if (totalBytesDownloaded > 0)
+                {
+                    Console.WriteLine("Partial download not supported by server, but local file exists. Deleting local file and starting full download.");
+                    TryDeleteFile(localFilePath);
+                    totalBytesDownloaded = 0;
+                    ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // Reset progress
+                }
+
                 Console.WriteLine("Partial download not supported. Attempting full download.");
                 try
                 {
-                    using var contentResponse = await _webSystemCalls.DownloadContentAsync(contentFileUrl, cancellationToken).ConfigureAwait(false);
-
-                    if (!contentResponse.IsSuccessStatusCode)
-                    {
-                        Console.WriteLine($"Failed to download content. Status code: {contentResponse.StatusCode}");
-                        return false; // Add retry later
-                    }
-
-                    Console.WriteLine($"Writing to file: {localFilePath}");
-                    using var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
-                    using var contentStream = await contentResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-
-                    var buffer = new byte[BufferSize];
-                    int bytesRead;
-                    while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
-                    {
-                        await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
-                        totalBytesDownloaded += bytesRead;
-
-                        // Report progress during copy
-                        ReportProgress(onProgressChanged, totalFileSize.Value, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time
-                    }
-
-                    Console.WriteLine("Full download completed and file written.");
-                    // TODO: Add integrity check here in a later step
-                    return true; // Success for now
+                    return await PerformFullDownloadAsync(contentFileUrl, localFilePath, totalFileSize.Value, 
+                        onProgressChanged, cancellationToken);
 
                 }
-                catch (HttpRequestException ex)
-                {
-                    Console.WriteLine($"Network error during full download: {ex.Message}");
-                    return false; // Add retry later
-                }
-                catch (IOException ex)
-                {
-                    Console.WriteLine($"File system error during full download: {ex.Message}");
-                    // Attempt to delete potentially corrupted file
-                    TryDeleteFile(localFilePath);
-                    return false;
-                }
-                catch (OperationCanceledException)
-                {
-                    Console.WriteLine("Operation cancelled during full download.");
-                    // Attempt to delete potentially incomplete file
+                catch (Exception ex)
+                { 
+                    Console.WriteLine($"Error during full download path: {ex.Message}");
                     TryDeleteFile(localFilePath);
                     return false;
                 }
@@ -157,6 +170,65 @@ internal sealed class FileDownloader : IFileDownloader
         catch (UnauthorizedAccessException ex)
         {
             Console.WriteLine($"Warning: No permission to delete file '{filePath}': {ex.Message}");
+        }
+    }
+
+    private async Task<bool> PerformFullDownloadAsync(
+        string contentFileUrl, 
+        string localFilePath, 
+        long totalFileSize, 
+        Action<FileProgress> onProgressChanged,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var contentResponse = await _webSystemCalls.DownloadContentAsync(contentFileUrl, cancellationToken).ConfigureAwait(false);
+
+            if (!contentResponse.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Failed to download content. Status code: {contentResponse.StatusCode}");
+                return false; // Add retry later
+            }
+
+            Console.WriteLine($"Writing to file: {localFilePath}");
+            using var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
+            using var contentStream = await contentResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+
+            var buffer = new byte[BufferSize];
+            int bytesRead;
+            long totalBytesDownloaded = 0;
+            while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                totalBytesDownloaded += bytesRead;
+
+                // Report progress during copy
+                ReportProgress(onProgressChanged, totalFileSize, totalBytesDownloaded, TimeSpan.Zero); // TODO: Estimate time
+            }
+
+            Console.WriteLine("Full download completed and file written.");
+            // TODO: Add integrity check here in a later step
+            return true; // Success for now
+
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"Network error during full download: {ex.Message}");
+            return false; // Add retry later
+        }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"File system error during full download: {ex.Message}");
+            // Attempt to delete potentially corrupted file
+            TryDeleteFile(localFilePath);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("Operation cancelled during full download.");
+            // Attempt to delete potentially incomplete file
+            TryDeleteFile(localFilePath);
+            return false;
         }
     }
 }
