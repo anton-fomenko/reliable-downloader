@@ -38,7 +38,7 @@ internal sealed class FileDownloader : IFileDownloader
             Console.WriteLine($"Total file size: {totalFileSize?.ToString() ?? "Unknown"}");
             Console.WriteLine($"MD5 Hash available: {md5Hash != null}");
 
-            if (!totalFileSize.HasValue)
+            if (!totalFileSize.HasValue || totalFileSize == 0)
             {
                 Console.WriteLine("Cannot determine file size from headers. Cannot proceed.");
                 // Or potentially attempt a full download if size is not strictly needed upfront

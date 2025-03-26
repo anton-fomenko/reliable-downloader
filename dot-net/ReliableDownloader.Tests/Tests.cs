@@ -43,6 +43,25 @@ public class Tests
         _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once); // Verify HEAD call was made
     }
 
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalse_WhenContentLengthMissing()
+    {
+        // Arrange
+        var url = "http://no-length.com/file.msi";
+        var filePath = "file.msi";
+        var response = new HttpResponseMessage(HttpStatusCode.OK); // Missing Content-Length header
+
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(response);
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result == false);
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+    }
+
     private void HandleProgress(FileProgress progress)
     {
         _lastProgress = progress;
