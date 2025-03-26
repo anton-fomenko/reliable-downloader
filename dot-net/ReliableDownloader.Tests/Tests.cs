@@ -333,6 +333,189 @@ public class Tests
         Assert.That(_progressUpdates[^1].TotalBytesDownloaded, Is.EqualTo(fileSize));
     }
 
+    [Test]
+    public async Task TryDownloadFile_ShouldResumePartialDownload_WhenFileExists()
+    {
+        // Arrange
+        var url = "http://resume-partial.com/file.msi";
+        int fileSize = (int)(DefaultChunkSize * 1.5);
+        var testData = GenerateTestData(fileSize);
+        int existingSize = (int)(DefaultChunkSize / 2);
+        var existingData = testData.Take(existingSize).ToArray();
+
+        // Create a partial file simulating previous download
+        await File.WriteAllBytesAsync(_testFilePath, existingData);
+
+        // Mock Headers response
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(CreateHeadersResponse(fileSize, true));
+
+        // Mock Partial Content responses for remaining chunks
+        long currentPos = existingSize; // Start from existing size
+        while (currentPos < fileSize)
+        {
+            long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
+            long rangeFrom = currentPos;
+            long rangeTo = rangeFrom + bytesToDownload - 1;
+            _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token))
+                         .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom, rangeTo));
+            currentPos += bytesToDownload;
+        }
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result, Is.True);
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, 0, It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never); // Verify first chunk wasn't requested again
+
+        // Verify resumed chunks were requested
+        currentPos = existingSize;
+        while (currentPos < fileSize)
+        {
+            long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
+            long rangeFrom = currentPos;
+            long rangeTo = rangeFrom + bytesToDownload - 1;
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once);
+            currentPos += bytesToDownload;
+        }
+
+        Assert.That(File.Exists(_testFilePath), Is.True);
+        var writtenBytes = await File.ReadAllBytesAsync(_testFilePath);
+        CollectionAssert.AreEqual(testData, writtenBytes); // Verify full content
+
+        Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(2));
+        Assert.That(_progressUpdates[0].TotalBytesDownloaded, Is.EqualTo(existingSize)); // Check initial progress reflects resume state
+        Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalse_WhenPartialDownloadChunkFails()
+    {
+        // Arrange
+        var url = "http://partial-chunk-fails.com/file.msi";
+        int fileSize = (int)(DefaultChunkSize * 1.5);
+        var testData = GenerateTestData(fileSize);
+
+        // Mock Headers response
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(CreateHeadersResponse(fileSize, true));
+
+        // Mock First chunk success
+        long rangeFrom1 = 0;
+        long rangeTo1 = DefaultChunkSize - 1;
+        _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token))
+                     .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom1, rangeTo1));
+
+        // Mock Second chunk failure (e.g., server error)
+        long rangeFrom2 = DefaultChunkSize;
+        long rangeTo2 = fileSize - 1;
+        _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
+                     .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result, Is.False); // Should fail as retry isn't implemented yet
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once);
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.Once);
+        // File might exist partially, depending on where failure occurred vs file writing
+        Assert.That(File.Exists(_testFilePath), Is.True, "Partial file should still exist on failure (for potential resume).");
+        var currentSize = new FileInfo(_testFilePath).Length;
+        Assert.That(currentSize, Is.EqualTo(DefaultChunkSize), "File size should reflect successfully downloaded chunks.");
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalseAndKeepPartial_WhenCancelledDuringPartialDownload()
+    {
+        // Arrange
+        var url = "http://cancel-during-partial.com/file.msi";
+        int fileSize = (int)(DefaultChunkSize * 2.5);
+        var testData = GenerateTestData(fileSize);
+
+        // Mock Headers response
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(CreateHeadersResponse(fileSize, true));
+
+        // Mock First chunk success
+        long rangeFrom1 = 0;
+        long rangeTo1 = DefaultChunkSize - 1;
+        _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token))
+                     .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom1, rangeTo1));
+
+        // Mock Second chunk - make it slow and cancellable
+        long rangeFrom2 = DefaultChunkSize;
+        long rangeTo2 = rangeFrom2 + DefaultChunkSize - 1;
+        _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
+                     .Returns(async () => {
+                         await Task.Delay(150, _cts.Token); // Simulate network delay longer than cancel delay
+                         _cts.Token.ThrowIfCancellationRequested(); // Check before returning response
+                         return CreatePartialContentResponse(testData, rangeFrom2, rangeTo2);
+                     });
+
+
+        // Act
+        var downloadTask = _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Cancel shortly after the first chunk likely completes and second starts
+        await Task.Delay(100); // Wait a bit
+        _cts.Cancel();
+
+        var result = await downloadTask; // Await the task completion
+
+        // Assert
+        Assert.That(result, Is.False); // Should return false due to cancellation
+        Assert.That(_cts.IsCancellationRequested, Is.True);
+
+        // Verify first chunk was called, second was attempted (and cancelled)
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once);
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.AtMostOnce());
+
+        Assert.That(File.Exists(_testFilePath), Is.True, "Partial file should be kept after cancellation.");
+        var currentSize = new FileInfo(_testFilePath).Length;
+        Assert.That(currentSize, Is.EqualTo(DefaultChunkSize), "File size should reflect completed chunks before cancellation.");
+        Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0, Is.True, "Progress should not reach 100%");
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldRestartDownload_WhenExistingFileIsLargerThanTotalSize()
+    {
+        // Arrange
+        var url = "http://local-larger.com/file.msi";
+        int serverFileSize = 1000;
+        int localFileSize = 1500; // Local file is larger (corrupt?)
+        var testData = GenerateTestData(serverFileSize); // Represents correct server data
+        var localData = GenerateTestData(localFileSize); // Represents corrupt local data
+
+        await File.WriteAllBytesAsync(_testFilePath, localData); // Create oversized local file
+
+        // Mock Headers response (Partial Supported)
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(CreateHeadersResponse(serverFileSize, true));
+
+        // Mock partial download for the *correct* server file size
+        long rangeFrom = 0;
+        long rangeTo = serverFileSize - 1;
+        _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token))
+                      .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom, rangeTo));
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result, Is.True); // Expecting success after restart
+        _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once); // Verify it downloads the correct range
+
+        Assert.That(File.Exists(_testFilePath), Is.True);
+        var writtenBytes = await File.ReadAllBytesAsync(_testFilePath);
+        CollectionAssert.AreEqual(testData, writtenBytes, "File content should match server data after restart."); // Should contain correct data
+        Assert.That(writtenBytes.Length, Is.EqualTo(serverFileSize)); // Size should be correct server size
+
+        Assert.That(_progressUpdates.Any(p => p.TotalBytesDownloaded == 0 && p.ProgressPercent == 0.0), Is.True, "Progress should have reset to 0.");
+        Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+    }
+
     private byte[] GenerateTestData(int size) => Enumerable.Range(0, size).Select(i => (byte)(i % 256)).ToArray();
 
     private HttpResponseMessage CreateHeadersResponse(long contentLength, bool supportPartial, byte[]? md5 = null)
