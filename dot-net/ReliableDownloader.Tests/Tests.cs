@@ -177,6 +177,34 @@ public class Tests
         Assert.That(result == false);
     }
 
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalse_WhenFullDownloadFails()
+    {
+        // Arrange
+        var url = "http://full-download-fails.com/file.msi";
+        long fileSize = 1024;
+
+        // Mock Headers response (No Accept-Ranges)
+        var headersResponse = new HttpResponseMessage(HttpStatusCode.OK);
+        headersResponse.Content = new ByteArrayContent(Array.Empty<byte>());
+        headersResponse.Content.Headers.ContentLength = fileSize;
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                    .ReturnsAsync(headersResponse);
+
+        // Mock Content response (Failure)
+        var contentResponse = new HttpResponseMessage(HttpStatusCode.InternalServerError);
+        _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                     .ReturnsAsync(contentResponse);
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result == false);
+        _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
+        Assert.That(File.Exists(_testFilePath) == false, "File should not exist after failed download.");
+    }
+
     private void HandleProgress(FileProgress progress)
     {
         _progressUpdates.Add(progress);
