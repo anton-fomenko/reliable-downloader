@@ -112,6 +112,42 @@ public class Tests
         _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
     }
 
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalseAndNotProceed_WhenHeadersRequestThrowsException()
+    {
+        // Arrange
+        var url = "http://exception.com/file.msi";
+        var filePath = "file.msi";
+
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ThrowsAsync(new HttpRequestException("Network unavailable"));
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result == false);
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+        // TODO Make sure that download request doesn't happen
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalse_WhenCancelledDuringHeaderCheck()
+    {
+        // Arrange
+        var url = "http://cancellable.com/file.msi";
+        var filePath = "file.msi";
+        _cts.Cancel(); // Cancel immediately
+
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                      .ThrowsAsync(new OperationCanceledException()); // Simulate cancellation during call
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result == false);
+    }
 
     private void HandleProgress(FileProgress progress)
     {
