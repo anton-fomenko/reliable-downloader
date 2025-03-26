@@ -2,6 +2,7 @@
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 
 namespace ReliableDownloader.Tests;
@@ -14,6 +15,7 @@ public class Tests
     private readonly List<FileProgress> _progressUpdates = new();
     private CancellationTokenSource _cts;
     private readonly string _testFilePath = "test_download.msi";
+    private const long DefaultChunkSize = 1 * 1024 * 1024; // Match downloader chunk size
 
     public Tests()
     {
@@ -277,6 +279,84 @@ public class Tests
         Assert.That(!File.Exists(_testFilePath), "File should be deleted after cancellation during download.");
         Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0 || _progressUpdates.Count == 0,
             "Progress should not reach 100% if cancelled during copy");
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldPerformPartialDownload_WhenSupported()
+    {
+        // Arrange
+        var url = "http://partial-support.com/file.msi";
+        int fileSize = (int)(DefaultChunkSize * 2.5); // Test multiple chunks + final partial chunk
+        var testData = GenerateTestData(fileSize);
+
+        // Mock Headers response (Partial Supported)
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ReturnsAsync(CreateHeadersResponse(fileSize, true));
+
+        // Mock Partial Content responses for each chunk
+        long currentPos = 0;
+        while (currentPos < fileSize)
+        {
+            long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
+            long rangeFrom = currentPos;
+            long rangeTo = rangeFrom + bytesToDownload - 1;
+            _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token))
+                         .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom, rangeTo));
+            currentPos += bytesToDownload;
+        }
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, _testFilePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result, Is.True);
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+        _mockWebCalls.Verify(w => w.DownloadContentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never); // Full download NOT called
+
+        // Verify all partial download calls were made
+        currentPos = 0;
+        while (currentPos < fileSize)
+        {
+            long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
+            long rangeFrom = currentPos;
+            long rangeTo = rangeFrom + bytesToDownload - 1;
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once);
+            currentPos += bytesToDownload;
+        }
+
+        Assert.That(File.Exists(_testFilePath), Is.True, "Downloaded file should exist.");
+        var writtenBytes = await File.ReadAllBytesAsync(_testFilePath);
+        CollectionAssert.AreEqual(testData, writtenBytes, "Downloaded file content mismatch.");
+
+        Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(3), "Should have multiple progress updates."); // Start + chunks + end
+        Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+        Assert.That(_progressUpdates[^1].TotalBytesDownloaded, Is.EqualTo(fileSize));
+    }
+
+    private byte[] GenerateTestData(int size) => Enumerable.Range(0, size).Select(i => (byte)(i % 256)).ToArray();
+
+    private HttpResponseMessage CreateHeadersResponse(long contentLength, bool supportPartial, byte[]? md5 = null)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK);
+        if (supportPartial) response.Headers.AcceptRanges.Add("bytes");
+        response.Content = new ByteArrayContent(Array.Empty<byte>()); // Needs Content for Headers
+        response.Content.Headers.ContentLength = contentLength;
+        if (md5 != null) response.Content.Headers.ContentMD5 = md5;
+        return response;
+    }
+
+    private HttpResponseMessage CreatePartialContentResponse(byte[] fullData, long rangeFrom, long rangeTo)
+    {
+        if (rangeFrom >= fullData.Length) return new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable); // 416
+
+        rangeTo = Math.Min(rangeTo, fullData.Length - 1); // Clamp rangeTo
+        var partialData = fullData.Skip((int)rangeFrom).Take((int)(rangeTo - rangeFrom + 1)).ToArray();
+
+        var response = new HttpResponseMessage(HttpStatusCode.PartialContent); // 206
+        response.Content = new ByteArrayContent(partialData);
+        response.Content.Headers.ContentRange = new ContentRangeHeaderValue(rangeFrom, rangeTo, fullData.Length);
+        response.Content.Headers.ContentLength = partialData.Length;
+        return response;
     }
 
     private void HandleProgress(FileProgress progress)
