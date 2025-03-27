@@ -29,11 +29,10 @@ Console.WriteLine($"  Output: {exampleFilePath}");
 bool didDownloadSuccessfully = false;
 try
 {
-    // Start the download
     didDownloadSuccessfully = await fileDownloader.TryDownloadFile(
         exampleUrl,
         exampleFilePath,
-        progressReporter.HandleProgress, // Pass the reporter's method
+        progressReporter.HandleProgress,
         cts.Token);
 }
 catch (OperationCanceledException)
@@ -41,7 +40,7 @@ catch (OperationCanceledException)
     Console.WriteLine("[WARN] Download cancelled.");
     didDownloadSuccessfully = false;
 }
-catch (Exception ex) // Catch unexpected errors
+catch (Exception ex)
 {
     Console.WriteLine($"[FAIL] An unexpected error occurred: {ex.Message}");
     didDownloadSuccessfully = false;
