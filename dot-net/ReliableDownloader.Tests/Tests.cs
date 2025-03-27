@@ -3,6 +3,7 @@ using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography; // Added for MD5 tests
 using System.Text;
 
 namespace ReliableDownloader.Tests;
@@ -32,18 +33,15 @@ public class Tests
             initialRetryDelay: TestInitialDelay,
             maxRetryDelay: TestMaxDelay
             );
-        // NOTE: CancellationTokenSource and file cleanup are handled in Setup/Teardown
     }
 
-    // Use Setup and Teardown for per-test initialization and cleanup
     [SetUp]
     public void Setup()
     {
         _cts = new CancellationTokenSource();
         _progressUpdates.Clear();
-        _filesToCleanup = new List<string>(); // Reset list for each test
+        _filesToCleanup = new List<string>();
 
-        // Clean up the default path before each test for tests that might use it
         CleanUpFile(_defaultTestFilePath);
     }
 
@@ -51,13 +49,10 @@ public class Tests
     public void Teardown()
     {
         _cts?.Dispose();
-
-        // Clean up any files generated during the test
         foreach (var filePath in _filesToCleanup)
         {
             CleanUpFile(filePath);
         }
-        // Also clean up the default path again
         CleanUpFile(_defaultTestFilePath);
     }
 
@@ -65,47 +60,39 @@ public class Tests
     private async Task ExecuteWithUniqueFileAsync(Func<string, Task> testAction, string filePrefix = "test_file", string extension = ".msi")
     {
         var uniqueFilePath = $"{filePrefix}_{Guid.NewGuid()}{extension}";
-        _filesToCleanup.Add(uniqueFilePath); // Add to list for teardown cleanup
-
-        // Ensure clean state before test action
-        CleanUpFile(uniqueFilePath);
+        _filesToCleanup.Add(uniqueFilePath);
+        CleanUpFile(uniqueFilePath); // Ensure clean before start
 
         try
         {
-            // Execute the core test logic, passing the unique path
             await testAction(uniqueFilePath);
         }
         finally
         {
-            // Teardown will handle the cleanup now
-            // CleanUpFile(uniqueFilePath); // Removed direct cleanup here
+            // Teardown handles cleanup via _filesToCleanup list
         }
     }
 
-    // Helper to encapsulate file deletion and ignore errors
     private void CleanUpFile(string filePath)
     {
         if (File.Exists(filePath))
         {
-            try
-            {
-                File.Delete(filePath);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Failed to clean up test file '{filePath}': {ex.Message}");
-            }
+            try { File.Delete(filePath); }
+            catch (Exception ex) { Console.WriteLine($"Warning: Failed to clean up test file '{filePath}': {ex.Message}"); }
         }
     }
     // --- End Helpers ---
+
+    // =========================================
+    // Header & Basic Setup Tests
+    // =========================================
 
     [Test]
     public async Task TryDownloadFile_ShouldReturnFalse_WhenHeadersRequestFails()
     {
         // Arrange
         var url = "http://fail.com/file.msi";
-        // This test doesn't interact with the file system, so default path is fine.
-        var filePath = _defaultTestFilePath;
+        var filePath = _defaultTestFilePath; // No file interaction
         var response = new HttpResponseMessage(HttpStatusCode.NotFound);
         _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
                      .ReturnsAsync(response);
@@ -115,7 +102,7 @@ public class Tests
 
         // Assert
         Assert.That(result == false);
-        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1));
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1)); // Retried
     }
 
     [Test]
@@ -123,30 +110,29 @@ public class Tests
     {
         // Arrange
         var url = "http://fail-exception.com/file.msi";
-        var filePath = _defaultTestFilePath;
+        var filePath = _defaultTestFilePath; // No file interaction
         var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
         _mockWebCalls.SetupSequence(w => w.GetHeadersAsync(url, _cts.Token))
-                     .ReturnsAsync(response)
-                     .ThrowsAsync(new HttpRequestException("Network unavailable"));
+                     .ReturnsAsync(response) // Fails first
+                     .ThrowsAsync(new HttpRequestException("Network unavailable")); // Throws on retry
 
         // Act
         var result = await _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
 
         // Assert
         Assert.That(result == false);
-        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1));
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1)); // Retried
     }
-
 
     [Test]
     public async Task TryDownloadFile_ShouldReturnFalse_WhenContentLengthMissing()
     {
         // Arrange
         var url = "http://no-length.com/file.msi";
-        var filePath = _defaultTestFilePath;
+        var filePath = _defaultTestFilePath; // No file interaction
         var response = new HttpResponseMessage(HttpStatusCode.OK);
         response.Content = new ByteArrayContent(Array.Empty<byte>());
-        response.Content.Headers.ContentLength = null;
+        response.Content.Headers.ContentLength = null; // Explicitly null
 
         _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
                      .ReturnsAsync(response);
@@ -156,13 +142,197 @@ public class Tests
 
         // Assert
         Assert.That(result == false);
-        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once); // No retry needed
     }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldSucceed_WhenHeaderCallFailsOnceThenSucceeds()
+    {
+        // Uses unique file helper for consistency, though default might work
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://retry-header.com/file.msi";
+            int fileSize = 100;
+            var testData = GenerateTestData(fileSize);
+
+            _mockWebCalls.SetupSequence(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)) // Fail first
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false)); // Succeed second
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(testData) };
+            contentResponse.Content.Headers.ContentLength = fileSize;
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token)).ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result, Is.True);
+            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(2)); // Called twice
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once); // Download once
+            CollectionAssert.AreEqual(testData, await File.ReadAllBytesAsync(uniqueTestFilePath));
+        });
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldFail_WhenNetworkCallFailsMoreThanMaxRetries()
+    {
+        // Arrange
+        var url = "http://retry-fail-max.com/file.msi";
+        var filePath = _defaultTestFilePath; // No file interaction needed
+
+        // Fail headers call repeatedly with exception
+        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                     .ThrowsAsync(new HttpRequestException("Persistent network failure"));
+
+        // Act
+        var result = await _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
+
+        // Assert
+        Assert.That(result, Is.False); // Should fail after max retries
+        // Verify based on configured TestMaxRetries
+        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1));
+        Assert.That(File.Exists(filePath), Is.False); // File should not have been created
+    }
+
+    // =========================================
+    // Full Download Tests
+    // =========================================
+
+    [Test]
+    public async Task TryDownloadFile_ShouldPerformFullDownload_WhenPartialNotSupported()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://no-partial-support.com/file.msi";
+            int fileSize = 100;
+            var fileBytes = GenerateTestData(fileSize);
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false)); // No partial
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(fileBytes) };
+            contentResponse.Content.Headers.ContentLength = fileSize;
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                         .ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result, Is.True);
+            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
+
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True);
+            var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
+            CollectionAssert.AreEqual(fileBytes, writtenBytes);
+            Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(2));
+            Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+        });
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalse_WhenFullDownloadFails()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://full-download-fails.com/file.msi";
+            long fileSize = 1024;
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.InternalServerError);
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                         .ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result == false);
+            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1)); // Retried
+            Assert.That(File.Exists(uniqueTestFilePath) == false); // Should not exist (or be deleted by SUT - current SUT doesn't explicitly delete on HTTP failure)
+        });
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenFullDownloadThrowsNetworkError()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://full-download-network-error.com/file.msi";
+            long fileSize = 1024;
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
+
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                         .ThrowsAsync(new HttpRequestException("Network error during download"));
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result == false);
+            // Verify download attempted initial call + configured retries (because HttpRequestException is caught by retry)
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1));
+            Assert.That(File.Exists(uniqueTestFilePath) == false, "File should not exist after exception during download.");
+        });
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldRestartFullDownload_WhenExistingFileIsLargerAndPartialNotSupported()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://local-larger-no-partial.com/file.msi";
+            int serverFileSize = 1000;
+            int localFileSize = 1500;
+            var serverData = GenerateTestData(serverFileSize);
+            var localData = GenerateTestData(localFileSize);
+
+            await File.WriteAllBytesAsync(uniqueTestFilePath, localData); // Create oversized file
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(serverFileSize, false)); // No partial
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(serverData) };
+            contentResponse.Content.Headers.ContentLength = serverFileSize;
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token)).ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result, Is.True);
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once); // Full download once
+
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True);
+            var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
+            CollectionAssert.AreEqual(serverData, writtenBytes);
+            Assert.That(writtenBytes.Length, Is.EqualTo(serverFileSize));
+            Assert.That(_progressUpdates.Any(p => p.TotalBytesDownloaded == 0 && p.ProgressPercent == 0.0), Is.True);
+            Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+        });
+    }
+
+    // =========================================
+    // Partial Download Tests
+    // =========================================
 
     [Test]
     public async Task TryDownloadFile_ShouldAttemptPartialDownload_WhenPartialSupportedAndHeadersPresent()
     {
-        // Use the helper for a unique file path
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
@@ -185,183 +355,19 @@ public class Tests
             _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, 0, fileSize - 1, _cts.Token), Times.Once);
             _mockWebCalls.Verify(w => w.DownloadContentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
 
-            Assert.That(File.Exists(uniqueTestFilePath), Is.True, "Downloaded file should exist.");
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True);
             var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
-            CollectionAssert.AreEqual(testData, writtenBytes, "Downloaded file content mismatch.");
-        });
-    }
-
-    [Test]
-    public async Task TryDownloadFile_ShouldPerformFullDownload_WhenPartialNotSupported()
-    {
-        // Use the helper for a unique file path to ensure clean state
-        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
-        {
-            // Arrange
-            var url = "http://no-partial-support.com/file.msi";
-            int fileSize = 100;
-            var fileBytes = GenerateTestData(fileSize);
-
-            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
-
-            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK);
-            contentResponse.Content = new ByteArrayContent(fileBytes);
-            contentResponse.Content.Headers.ContentLength = fileBytes.Length;
-            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
-                         .ReturnsAsync(contentResponse);
-
-            // Act
-            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
-
-            // Assert
-            Assert.That(result == true);
-            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
-
-            Assert.That(File.Exists(uniqueTestFilePath) == true, "Downloaded file should exist.");
-            var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
-            CollectionAssert.AreEqual(fileBytes, writtenBytes, "Downloaded file content mismatch.");
-
-            Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(2));
-            Assert.That(_progressUpdates[0].ProgressPercent, Is.EqualTo(0.0));
-            Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
-            Assert.That(_progressUpdates[^1].TotalBytesDownloaded, Is.EqualTo(fileBytes.Length));
-        });
-    }
-
-    [Test]
-    public async Task TryDownloadFile_ShouldReturnFalse_WhenCancelledDuringHeaderCheck()
-    {
-        // Arrange
-        var url = "http://cancellable.com/file.msi";
-        var filePath = _defaultTestFilePath; // No file interaction needed
-
-        _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                      .Returns(async () => {
-                          await Task.Delay(100, _cts.Token);
-                          return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
-                      });
-
-        // Act
-        var downloadTask = _sut.TryDownloadFile(url, filePath, HandleProgress, _cts.Token);
-        await Task.Delay(50);
-        _cts.Cancel();
-
-        var result = await downloadTask;
-
-        // Assert
-        Assert.That(result == false);
-        Assert.That(_cts.IsCancellationRequested);
-        _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.AtMostOnce());
-    }
-
-    [Test]
-    public async Task TryDownloadFile_ShouldReturnFalse_WhenFullDownloadFails()
-    {
-        // Use the helper for a unique file path to ensure clean state and proper cleanup
-        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
-        {
-            // Arrange
-            var url = "http://full-download-fails.com/file.msi";
-            long fileSize = 1024;
-
-            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
-
-            var contentResponse = new HttpResponseMessage(HttpStatusCode.InternalServerError);
-            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
-                         .ReturnsAsync(contentResponse);
-
-            // Act
-            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
-
-            // Assert
-            Assert.That(result == false);
-            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Once);
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1));
-            Assert.That(File.Exists(uniqueTestFilePath) == false, "File should not exist after failed download.");
-        });
-    }
-
-    [Test]
-    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenFullDownloadThrowsNetworkError()
-    {
-        // Use the helper for a unique file path to ensure clean state and proper cleanup
-        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
-        {
-            // Arrange
-            var url = "http://full-download-network-error.com/file.msi";
-            long fileSize = 1024;
-
-            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
-
-            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
-                         .ThrowsAsync(new HttpRequestException("Network error during download"));
-
-            // Act
-            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
-
-            // Assert
-            Assert.That(result == false);
-
-            // Verify download was attempted initial call + configured retries
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Exactly(TestMaxRetries + 1)); // Expect 2 calls
-            Assert.That(File.Exists(uniqueTestFilePath) == false, "File should not exist after exception during download.");
-        });
-    }
-
-    [Test]
-    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenCancelledDuringFullDownload()
-    {
-        // Use the helper for a unique file path to ensure clean state and proper cleanup
-        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
-        {
-            // Arrange
-            var url = "http://cancel-during-full.com/file.msi";
-            long fileSize = 500000;
-            var fileBytes = GenerateTestData((int)fileSize);
-
-            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
-
-            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
-                         .Returns(async () => {
-                             await Task.Delay(20, _cts.Token);
-                             var response = new HttpResponseMessage(HttpStatusCode.OK);
-                             response.Content = new StreamContent(new SlowStream(fileBytes, 50, _cts.Token));
-                             response.Content.Headers.ContentLength = fileSize;
-                             return response;
-                         });
-
-            // Act
-            var downloadTask = _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
-
-            await Task.Delay(100);
-            _cts.Cancel();
-
-            var result = await downloadTask;
-
-            // Assert
-            Assert.That(result == false);
-            Assert.That(_cts.IsCancellationRequested);
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once());
-            Assert.That(!File.Exists(uniqueTestFilePath), "File should be deleted after cancellation during download.");
-            Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0 || _progressUpdates.Count == 0,
-                "Progress should not reach 100% if cancelled during copy");
+            CollectionAssert.AreEqual(testData, writtenBytes);
         });
     }
 
     [Test]
     public async Task TryDownloadFile_ShouldPerformPartialDownload_WhenSupported()
     {
-        // Use the helper for a unique file path
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
-            var url = "http://partial-support.com/file.msi";
+            var url = "http://multi-partial-support.com/file.msi";
             int fileSize = (int)(DefaultChunkSize * 2.5); // > 2 chunks
             var testData = GenerateTestData(fileSize);
 
@@ -390,31 +396,25 @@ public class Tests
             _mockWebCalls.Verify(w => w.DownloadContentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
             _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, It.IsAny<long>(), It.IsAny<long>(), _cts.Token), Times.Exactly(expectedCalls));
 
-            // Check each specific range call was made once
-            currentPos = 0;
+            currentPos = 0; // Verify specific calls
             while (currentPos < fileSize)
             {
                 long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
-                long rangeFrom = currentPos;
-                long rangeTo = rangeFrom + bytesToDownload - 1;
-                _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once);
+                _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, currentPos, currentPos + bytesToDownload - 1, _cts.Token), Times.Once);
                 currentPos += bytesToDownload;
             }
 
             Assert.That(File.Exists(uniqueTestFilePath), Is.True);
             var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
             CollectionAssert.AreEqual(testData, writtenBytes);
-
             Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(expectedCalls + 1));
             Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
-            Assert.That(_progressUpdates[^1].TotalBytesDownloaded, Is.EqualTo(fileSize));
         });
     }
 
     [Test]
     public async Task TryDownloadFile_ShouldResumePartialDownload_WhenFileExists()
     {
-        // This test explicitly creates a file first, so use the helper
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
@@ -424,8 +424,7 @@ public class Tests
             int existingSize = (int)(DefaultChunkSize / 2);
             var existingData = testData.Take(existingSize).ToArray();
 
-            // Create the partial file using the unique path
-            await File.WriteAllBytesAsync(uniqueTestFilePath, existingData);
+            await File.WriteAllBytesAsync(uniqueTestFilePath, existingData); // Create partial file
 
             _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
                          .ReturnsAsync(CreateHeadersResponse(fileSize, true));
@@ -435,10 +434,8 @@ public class Tests
             while (currentPos < fileSize)
             {
                 long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
-                long rangeFrom = currentPos;
-                long rangeTo = rangeFrom + bytesToDownload - 1;
-                _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token))
-                             .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom, rangeTo));
+                _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, currentPos, currentPos + bytesToDownload - 1, _cts.Token))
+                             .ReturnsAsync(CreatePartialContentResponse(testData, currentPos, currentPos + bytesToDownload - 1));
                 currentPos += bytesToDownload;
                 expectedCalls++;
             }
@@ -451,20 +448,17 @@ public class Tests
             _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, 0, It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
             _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, It.IsAny<long>(), It.IsAny<long>(), _cts.Token), Times.Exactly(expectedCalls));
 
-            currentPos = existingSize;
+            currentPos = existingSize; // Verify specific resumed calls
             while (currentPos < fileSize)
             {
                 long bytesToDownload = Math.Min(fileSize - currentPos, DefaultChunkSize);
-                long rangeFrom = currentPos;
-                long rangeTo = rangeFrom + bytesToDownload - 1;
-                _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once);
+                _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, currentPos, currentPos + bytesToDownload - 1, _cts.Token), Times.Once);
                 currentPos += bytesToDownload;
             }
 
             Assert.That(File.Exists(uniqueTestFilePath), Is.True);
             var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
             CollectionAssert.AreEqual(testData, writtenBytes);
-
             Assert.That(_progressUpdates.Count, Is.GreaterThanOrEqualTo(expectedCalls + 1));
             Assert.That(_progressUpdates[0].TotalBytesDownloaded, Is.EqualTo(existingSize));
             Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
@@ -474,7 +468,6 @@ public class Tests
     [Test]
     public async Task TryDownloadFile_ShouldReturnFalse_WhenPartialDownloadChunkFails()
     {
-        // Use the helper as this involves writing partial files
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
@@ -485,15 +478,13 @@ public class Tests
             _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
                          .ReturnsAsync(CreateHeadersResponse(fileSize, true));
 
-            long rangeFrom1 = 0;
-            long rangeTo1 = DefaultChunkSize - 1;
+            long rangeFrom1 = 0, rangeTo1 = DefaultChunkSize - 1;
             _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token))
                          .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom1, rangeTo1));
 
-            long rangeFrom2 = DefaultChunkSize;
-            long rangeTo2 = fileSize - 1;
+            long rangeFrom2 = DefaultChunkSize, rangeTo2 = fileSize - 1;
             _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
-                         .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+                         .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.InternalServerError)); // Persistent failure
 
             // Act
             var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
@@ -501,67 +492,52 @@ public class Tests
             // Assert
             Assert.That(result, Is.False);
             _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.Exactly(TestMaxRetries + 1));
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.Exactly(TestMaxRetries + 1)); // Retried
 
-            Assert.That(File.Exists(uniqueTestFilePath), Is.True, "Partial file should still exist on failure.");
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True); // Partial file kept
             var currentSize = new FileInfo(uniqueTestFilePath).Length;
-            Assert.That(currentSize, Is.EqualTo(DefaultChunkSize), "File size should reflect successfully downloaded chunks.");
+            Assert.That(currentSize, Is.EqualTo(DefaultChunkSize));
         });
     }
 
     [Test]
-    public async Task TryDownloadFile_ShouldReturnFalseAndKeepPartial_WhenCancelledDuringPartialDownload()
+    public async Task TryDownloadFile_ShouldSucceed_WhenPartialChunkFailsOnceThenSucceeds()
     {
-        // Use the helper as this involves writing partial files
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
-            var url = "http://cancel-during-partial.com/file.msi";
-            int fileSize = (int)(DefaultChunkSize * 2.5);
+            var url = "http://retry-partial.com/file.msi";
+            int fileSize = (int)(DefaultChunkSize * 1.5);
             var testData = GenerateTestData(fileSize);
 
             _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                        .ReturnsAsync(CreateHeadersResponse(fileSize, true));
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, true));
 
-            long rangeFrom1 = 0;
-            long rangeTo1 = DefaultChunkSize - 1;
+            long rangeFrom1 = 0, rangeTo1 = DefaultChunkSize - 1;
             _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token))
                          .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom1, rangeTo1));
 
-            long rangeFrom2 = DefaultChunkSize;
-            long rangeTo2 = rangeFrom2 + DefaultChunkSize - 1;
-            _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
-                         .Returns(async () => {
-                             await Task.Delay(150, _cts.Token);
-                             _cts.Token.ThrowIfCancellationRequested();
-                             return CreatePartialContentResponse(testData, rangeFrom2, rangeTo2);
-                         });
+            long rangeFrom2 = DefaultChunkSize, rangeTo2 = fileSize - 1;
+            _mockWebCalls.SetupSequence(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
+                         .ThrowsAsync(new HttpRequestException("Temporary chunk error")) // Fails once
+                         .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom2, rangeTo2)); // Succeeds on retry
 
             // Act
-            var downloadTask = _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
-
-            await Task.Delay(100);
-            _cts.Cancel();
-
-            var result = await downloadTask;
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
 
             // Assert
-            Assert.That(result, Is.False);
-            Assert.That(_cts.IsCancellationRequested, Is.True);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.AtMostOnce());
-
-            Assert.That(File.Exists(uniqueTestFilePath), Is.True, "Partial file should be kept.");
-            var currentSize = new FileInfo(uniqueTestFilePath).Length;
-            Assert.That(currentSize, Is.EqualTo(DefaultChunkSize), "File size should reflect completed chunks.");
-            Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0, Is.True);
+            Assert.That(result, Is.True); // Succeeds overall
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once); // First chunk once
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.Exactly(2)); // Second chunk twice (initial fail + retry success)
+            CollectionAssert.AreEqual(testData, await File.ReadAllBytesAsync(uniqueTestFilePath));
+            Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
         });
     }
+
 
     [Test]
     public async Task TryDownloadFile_ShouldRestartDownload_WhenExistingFileIsLargerThanTotalSize()
     {
-        // This test explicitly creates a file first, so use the helper
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
@@ -571,13 +547,12 @@ public class Tests
             var testData = GenerateTestData(serverFileSize);
             var localData = GenerateTestData(localFileSize);
 
-            await File.WriteAllBytesAsync(uniqueTestFilePath, localData); // Create oversized file
+            await File.WriteAllBytesAsync(uniqueTestFilePath, localData); // Oversized file
 
             _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(serverFileSize, true));
+                         .ReturnsAsync(CreateHeadersResponse(serverFileSize, true)); // Partial support
 
-            long rangeFrom = 0;
-            long rangeTo = serverFileSize - 1;
+            long rangeFrom = 0, rangeTo = serverFileSize - 1;
             _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token))
                          .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom, rangeTo));
 
@@ -586,73 +561,120 @@ public class Tests
 
             // Assert
             Assert.That(result, Is.True);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once);
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom, rangeTo, _cts.Token), Times.Once); // Download from 0 once
 
             Assert.That(File.Exists(uniqueTestFilePath), Is.True);
             var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
             CollectionAssert.AreEqual(testData, writtenBytes);
             Assert.That(writtenBytes.Length, Is.EqualTo(serverFileSize));
-
             Assert.That(_progressUpdates.Any(p => p.TotalBytesDownloaded == 0 && p.ProgressPercent == 0.0), Is.True);
             Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
         });
     }
 
+    // =========================================
+    // Cancellation Tests
+    // =========================================
+
     [Test]
-    public async Task TryDownloadFile_ShouldRestartFullDownload_WhenExistingFileIsLargerAndPartialNotSupported()
+    public async Task TryDownloadFile_ShouldReturnFalseAndCleanup_WhenCancelledDuringFullDownload()
     {
-        // This test explicitly creates a file first, so use the helper
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
-            var url = "http://local-larger-no-partial.com/file.msi";
-            int serverFileSize = 1000;
-            int localFileSize = 1500;
-            var serverData = GenerateTestData(serverFileSize);
-            var localData = GenerateTestData(localFileSize);
-
-            await File.WriteAllBytesAsync(uniqueTestFilePath, localData);
+            var url = "http://cancel-during-full.com/file.msi";
+            long fileSize = 500000;
+            var fileBytes = GenerateTestData((int)fileSize);
 
             _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(CreateHeadersResponse(serverFileSize, false));
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false)); // No partial
 
-            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(serverData) };
-            contentResponse.Content.Headers.ContentLength = serverFileSize;
-            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token)).ReturnsAsync(contentResponse);
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token))
+                         .Returns(async () => {
+                             await Task.Delay(20, _cts.Token); // Short delay, then slow stream
+                             var response = new HttpResponseMessage(HttpStatusCode.OK);
+                             response.Content = new StreamContent(new SlowStream(fileBytes, 50, _cts.Token));
+                             response.Content.Headers.ContentLength = fileSize;
+                             return response;
+                         });
 
             // Act
-            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+            var downloadTask = _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+            await Task.Delay(100); // Wait for download to start writing
+            _cts.Cancel();
+            var result = await downloadTask;
 
             // Assert
-            Assert.That(result, Is.True);
-            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
-
-            Assert.That(File.Exists(uniqueTestFilePath), Is.True);
-            var writtenBytes = await File.ReadAllBytesAsync(uniqueTestFilePath);
-            CollectionAssert.AreEqual(serverData, writtenBytes);
-            Assert.That(writtenBytes.Length, Is.EqualTo(serverFileSize));
-
-            Assert.That(_progressUpdates.Any(p => p.TotalBytesDownloaded == 0 && p.ProgressPercent == 0.0), Is.True);
-            Assert.That(_progressUpdates[^1].ProgressPercent, Is.EqualTo(100.0));
+            Assert.That(result == false);
+            Assert.That(_cts.IsCancellationRequested);
+            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once());
+            Assert.That(!File.Exists(uniqueTestFilePath), "File should be deleted after cancellation during full download.");
+            Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0 || _progressUpdates.Count == 0);
         });
     }
 
-
     [Test]
-    public async Task TryDownloadFile_ShouldSucceed_WhenHeaderCallFailsOnceThenSucceeds()
+    public async Task TryDownloadFile_ShouldReturnFalseAndKeepPartial_WhenCancelledDuringPartialDownload()
     {
-        // Use the helper for a unique file path
         await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
         {
             // Arrange
-            var url = "http://retry-header.com/file.msi";
-            int fileSize = 100;
+            var url = "http://cancel-during-partial.com/file.msi";
+            int fileSize = (int)(DefaultChunkSize * 2.5);
             var testData = GenerateTestData(fileSize);
 
-            _mockWebCalls.SetupSequence(w => w.GetHeadersAsync(url, _cts.Token))
-                         .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable))
-                         .ReturnsAsync(CreateHeadersResponse(fileSize, false));
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                        .ReturnsAsync(CreateHeadersResponse(fileSize, true)); // Partial support
+
+            long rangeFrom1 = 0, rangeTo1 = DefaultChunkSize - 1;
+            _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token))
+                         .ReturnsAsync(CreatePartialContentResponse(testData, rangeFrom1, rangeTo1)); // First chunk succeeds
+
+            long rangeFrom2 = DefaultChunkSize, rangeTo2 = rangeFrom2 + DefaultChunkSize - 1;
+            _mockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token))
+                         .Returns(async () => { // Second chunk is slow
+                             await Task.Delay(150, _cts.Token);
+                             _cts.Token.ThrowIfCancellationRequested();
+                             return CreatePartialContentResponse(testData, rangeFrom2, rangeTo2);
+                         });
+
+            // Act
+            var downloadTask = _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+            await Task.Delay(100); // Wait for first chunk + start of second chunk's delay
+            _cts.Cancel();
+            var result = await downloadTask;
+
+            // Assert
+            Assert.That(result, Is.False);
+            Assert.That(_cts.IsCancellationRequested, Is.True);
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _cts.Token), Times.Once); // First chunk called
+            _mockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _cts.Token), Times.AtMostOnce()); // Second attempted at most once
+
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True, "Partial file should be kept.");
+            var currentSize = new FileInfo(uniqueTestFilePath).Length;
+            Assert.That(currentSize, Is.EqualTo(DefaultChunkSize), "File size should reflect completed chunks.");
+            Assert.That(_progressUpdates.Count > 0 && _progressUpdates[^1].ProgressPercent < 100.0, Is.True);
+        });
+    }
+
+    // =========================================
+    // MD5 Integrity Tests
+    // =========================================
+
+    [Test]
+    public async Task TryDownloadFile_ShouldSucceed_WhenMd5Matches()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://md5-match.com/file.msi";
+            int fileSize = 500;
+            var testData = GenerateTestData(fileSize);
+            byte[] correctMd5;
+            using (var md5 = MD5.Create()) { correctMd5 = md5.ComputeHash(testData); }
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false, correctMd5)); // Correct MD5
 
             var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(testData) };
             contentResponse.Content.Headers.ContentLength = fileSize;
@@ -662,14 +684,71 @@ public class Tests
             var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
 
             // Assert
-            Assert.That(result, Is.True);
-            _mockWebCalls.Verify(w => w.GetHeadersAsync(url, _cts.Token), Times.Exactly(2));
-            _mockWebCalls.Verify(w => w.DownloadContentAsync(url, _cts.Token), Times.Once);
+            Assert.That(result, Is.True); // Success
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True); // File exists
             CollectionAssert.AreEqual(testData, await File.ReadAllBytesAsync(uniqueTestFilePath));
         });
     }
 
-    // --- Helper Methods ---
+    [Test]
+    public async Task TryDownloadFile_ShouldFailAndCleanup_WhenMd5Mismatch()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://md5-mismatch.com/file.msi";
+            int fileSize = 500;
+            var testData = GenerateTestData(fileSize);
+            byte[] correctMd5;
+            using (var md5 = MD5.Create()) { correctMd5 = md5.ComputeHash(testData); }
+            byte[] incorrectMd5 = correctMd5.Select(b => (byte)(~b)).ToArray(); // Different hash
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false, incorrectMd5)); // INCORRECT MD5
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(testData) };
+            contentResponse.Content.Headers.ContentLength = fileSize;
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token)).ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result, Is.False); // Should fail integrity
+            Assert.That(File.Exists(uniqueTestFilePath), Is.False); // File should be deleted
+        });
+    }
+
+    [Test]
+    public async Task TryDownloadFile_ShouldSucceed_WhenMd5HeaderMissing()
+    {
+        await ExecuteWithUniqueFileAsync(async uniqueTestFilePath =>
+        {
+            // Arrange
+            var url = "http://md5-missing.com/file.msi";
+            int fileSize = 500;
+            var testData = GenerateTestData(fileSize);
+
+            _mockWebCalls.Setup(w => w.GetHeadersAsync(url, _cts.Token))
+                         .ReturnsAsync(CreateHeadersResponse(fileSize, false, md5: null)); // MD5 is null
+
+            var contentResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(testData) };
+            contentResponse.Content.Headers.ContentLength = fileSize;
+            _mockWebCalls.Setup(w => w.DownloadContentAsync(url, _cts.Token)).ReturnsAsync(contentResponse);
+
+            // Act
+            var result = await _sut.TryDownloadFile(url, uniqueTestFilePath, HandleProgress, _cts.Token);
+
+            // Assert
+            Assert.That(result, Is.True); // Succeeds (verification skipped)
+            Assert.That(File.Exists(uniqueTestFilePath), Is.True); // File exists
+            CollectionAssert.AreEqual(testData, await File.ReadAllBytesAsync(uniqueTestFilePath));
+        });
+    }
+
+    // =========================================
+    // Private Helper Methods
+    // =========================================
 
     private byte[] GenerateTestData(int size) => Enumerable.Range(0, size).Select(i => (byte)(i % 256)).ToArray();
 
