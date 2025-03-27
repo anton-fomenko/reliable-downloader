@@ -2,7 +2,6 @@
 using NUnit.Framework;
 using NUnit.Framework.Legacy; // Needed for CollectionAssert
 using System.Net;
-using System.Net.Http.Headers;
 // Make sure your helper class namespace is accessible
 // using static ReliableDownloader.Tests.FileDownloaderTestHelper; // Optional
 
@@ -192,7 +191,7 @@ namespace ReliableDownloader.Tests
                 // Arrange
                 var url = "http://partial-chunk-fails.com/file.msi";
                 // Use static helper constant
-                int fileSize = (int)(FileDownloaderTestHelper.DefaultChunkSize * 1.5); // Requires 2 chunks
+                int fileSize = (int)(FileDownloaderTestHelper.DefaultTestChunkSize * 1.5); // Requires 2 chunks
                 // Use static helper
                 var testData = FileDownloaderTestHelper.GenerateTestData(fileSize);
 
@@ -200,12 +199,12 @@ namespace ReliableDownloader.Tests
                             .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreateHeadersResponse(fileSize, true)));
 
                 // Mock the first chunk successfully
-                long rangeFrom1 = 0, rangeTo1 = FileDownloaderTestHelper.DefaultChunkSize - 1;
+                long rangeFrom1 = 0, rangeTo1 = FileDownloaderTestHelper.DefaultTestChunkSize - 1;
                 _context.MockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _context.Cts.Token))
                              .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreatePartialContentResponse(testData, rangeFrom1, rangeTo1)));
 
                 // Mock the second chunk to fail consistently
-                long rangeFrom2 = FileDownloaderTestHelper.DefaultChunkSize, rangeTo2 = fileSize - 1;
+                long rangeFrom2 = FileDownloaderTestHelper.DefaultTestChunkSize , rangeTo2 = fileSize - 1;
                 _context.MockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _context.Cts.Token))
                              .Returns(() => Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError)));
 
@@ -218,7 +217,7 @@ namespace ReliableDownloader.Tests
                 // Use static helper constant
                 _context.MockWebCalls.Verify(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _context.Cts.Token), Times.Exactly(FileDownloaderTestHelper.TestMaxRetries + 1));
                 Assert.That(File.Exists(uniqueTestFilePath), Is.True);
-                Assert.That(new FileInfo(uniqueTestFilePath).Length, Is.EqualTo(FileDownloaderTestHelper.DefaultChunkSize));
+                Assert.That(new FileInfo(uniqueTestFilePath).Length, Is.EqualTo(FileDownloaderTestHelper.DefaultTestChunkSize ));
             });
         }
 
@@ -232,7 +231,7 @@ namespace ReliableDownloader.Tests
                 // Arrange
                 var url = "http://retry-partial.com/file.msi";
                 // Use static helper constant
-                int fileSize = (int)(FileDownloaderTestHelper.DefaultChunkSize * 1.5); // Requires 2 chunks
+                int fileSize = (int)(FileDownloaderTestHelper.DefaultTestChunkSize * 1.5); // Requires 2 chunks
                 // Use static helper
                 var testData = FileDownloaderTestHelper.GenerateTestData(fileSize);
 
@@ -240,12 +239,12 @@ namespace ReliableDownloader.Tests
                              .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreateHeadersResponse(fileSize, true)));
 
                 // Mock the first chunk successfully
-                long rangeFrom1 = 0, rangeTo1 = FileDownloaderTestHelper.DefaultChunkSize - 1;
+                long rangeFrom1 = 0, rangeTo1 = FileDownloaderTestHelper.DefaultTestChunkSize - 1;
                 _context.MockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, rangeFrom1, rangeTo1, _context.Cts.Token))
                              .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreatePartialContentResponse(testData, rangeFrom1, rangeTo1)));
 
                 // Mock the second chunk to fail once (exception), then succeed
-                long rangeFrom2 = FileDownloaderTestHelper.DefaultChunkSize, rangeTo2 = fileSize - 1;
+                long rangeFrom2 = FileDownloaderTestHelper.DefaultTestChunkSize , rangeTo2 = fileSize - 1;
                 _context.MockWebCalls.SetupSequence(w => w.DownloadPartialContentAsync(url, rangeFrom2, rangeTo2, _context.Cts.Token))
                              .ThrowsAsync(new HttpRequestException("Temporary chunk error"))
                              .ReturnsAsync(FileDownloaderTestHelper.CreatePartialContentResponse(testData, rangeFrom2, rangeTo2)); // Succeeds on retry

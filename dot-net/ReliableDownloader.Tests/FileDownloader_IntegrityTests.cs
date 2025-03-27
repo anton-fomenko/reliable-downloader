@@ -1,9 +1,6 @@
-﻿using Moq;
-using NUnit.Framework;
+﻿using NUnit.Framework;
 using NUnit.Framework.Legacy; // Needed for CollectionAssert
 using System.Net;
-using System.Net.Http.Headers;
-using System.Security.Cryptography; // Required for MD5 generation in tests
 // Make sure your helper class namespace is accessible
 // using static ReliableDownloader.Tests.FileDownloaderTestHelper; // Optional
 

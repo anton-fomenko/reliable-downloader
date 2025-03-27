@@ -1,8 +1,4 @@
 using ReliableDownloader;
-using System;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks; // Required for Task
 
 // Use top-level statements feature of modern C#
 var exampleUrl = args.Length > 0

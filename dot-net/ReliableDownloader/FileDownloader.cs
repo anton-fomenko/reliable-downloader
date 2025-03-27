@@ -1,521 +1,310 @@
-﻿using System.Diagnostics;
-using System.Net;
+﻿using System.Net;
 using System.Security.Cryptography;
 
 namespace ReliableDownloader;
 
+/// <summary>
+/// Main implementation for reliable file downloading.
+/// </summary>
 internal sealed class FileDownloader : IFileDownloader
 {
     private readonly IWebSystemCalls _webSystemCalls;
-    private const int BufferSize = 81920;
-    private const long DefaultChunkSize = 1 * 1024 * 1024;
+    private readonly FileDownloaderOptions _options;
+    private readonly DownloadSpeedEstimator _speedEstimator = new();
 
-
-    //With these default settings, the delays between retries would be(using exponential backoff capped at 60s):
-    //1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, 60s, 60s, 60s, 60s, 60s, 60s, 60s
-    //(There are 15 delays corresponding to the 15 retries).
-
-    //Total Maximum Wait Time(Sum of Delays):
-    //1 + 2 + 4 + 8 + 16 + 32 + (9 * 60)
-    //= 63 + 540
-    //= 603 seconds (10 minutes)
-    private const int DefaultMaxRetries = 15;
-    private readonly TimeSpan DefaultInitialRetryDelay = TimeSpan.FromSeconds(1);
-    private readonly TimeSpan DefaultMaxRetryDelay = TimeSpan.FromSeconds(60);
-
-    private readonly int _maxRetries;
-    private readonly TimeSpan _initialRetryDelay;
-    private readonly TimeSpan _maxRetryDelay;
-
-    // --- Fields for Progress Calculation ---
-    private readonly Stopwatch _stopwatch = new();
-    private long _startTimestampBytes = 0;
-    // --- End Fields for Progress Calculation ---
-
+    private record DownloadPrerequisites(
+        bool CanProceed,
+        long TotalFileSize,
+        byte[]? ExpectedMd5Hash,
+        bool PartialDownloadSupported,
+        long InitialBytesDownloaded,
+        bool RestartRequired
+    );
 
     public FileDownloader(
         IWebSystemCalls webSystemCalls,
-        int? maxRetries = null,
-        TimeSpan? initialRetryDelay = null,
-        TimeSpan? maxRetryDelay = null)
+        FileDownloaderOptions? options = null)
     {
-        _webSystemCalls = webSystemCalls;
-        _maxRetries = maxRetries ?? DefaultMaxRetries;
-        _initialRetryDelay = initialRetryDelay ?? DefaultInitialRetryDelay;
-        _maxRetryDelay = maxRetryDelay ?? DefaultMaxRetryDelay;
+        _webSystemCalls = webSystemCalls ?? throw new ArgumentNullException(nameof(webSystemCalls));
+        _options = options ?? new FileDownloaderOptions();
+        Console.WriteLine($"[DEBUG] FileDownloader initialized with options: MaxRetries={_options.MaxRetries}, InitialDelay={_options.InitialRetryDelay}, MaxDelay={_options.MaxRetryDelay}, ChunkSize={_options.ChunkSize}, BufferSize={_options.BufferSize}");
     }
 
+    /// <inheritdoc />
     public async Task<bool> TryDownloadFile(
         string contentFileUrl,
         string localFilePath,
         Action<FileProgress> onProgressChanged,
         CancellationToken cancellationToken)
     {
-        byte[]? expectedMd5Hash = null;
-        long totalFileSize = 0;
-        bool partialDownloadSupported = false;
-        long totalBytesDownloaded = 0; // Keep track across method scope
-
-        // Reset stopwatch for this download attempt
-        _stopwatch.Reset();
-        _startTimestampBytes = 0;
-
+        Console.WriteLine($"[INFO] Starting download attempt for URL: {contentFileUrl} to file: {localFilePath}");
+        bool downloadAttemptSuccess = false;
 
         try
         {
-            Console.WriteLine("Attempting to get headers...");
-            var headersResponse = await ExecuteWithRetryAsync(
-                async (token) => await _webSystemCalls.GetHeadersAsync(contentFileUrl, token).ConfigureAwait(false),
-                "GetHeaders",
-                cancellationToken).ConfigureAwait(false);
+            var prerequisites = await GetDownloadPrerequisitesAsync(contentFileUrl, localFilePath, cancellationToken).ConfigureAwait(false);
 
-            // Using statement ensures disposal even if exceptions occur later
-            using (headersResponse)
+            if (!prerequisites.CanProceed) return false;
+            if (prerequisites.InitialBytesDownloaded >= prerequisites.TotalFileSize && !prerequisites.RestartRequired) return true;
+            if (prerequisites.RestartRequired) TryDeleteFile(localFilePath);
+
+            _speedEstimator.Start(prerequisites.TotalFileSize, prerequisites.InitialBytesDownloaded);
+            ReportProgress(onProgressChanged, prerequisites.TotalFileSize, prerequisites.InitialBytesDownloaded);
+
+            try
             {
-                if (headersResponse == null || !headersResponse.IsSuccessStatusCode)
+                if (prerequisites.PartialDownloadSupported)
                 {
-                    Console.WriteLine($"Failed to get headers after retries. Status code: {headersResponse?.StatusCode}");
-                    return false;
+                    downloadAttemptSuccess = await PerformPartialDownloadAsync(contentFileUrl, localFilePath, prerequisites.TotalFileSize, prerequisites.InitialBytesDownloaded, onProgressChanged, cancellationToken).ConfigureAwait(false);
                 }
-
-                partialDownloadSupported = headersResponse.Headers.AcceptRanges.Contains("bytes");
-                long? totalFileSizeNullable = headersResponse.Content.Headers.ContentLength;
-                expectedMd5Hash = headersResponse.Content.Headers.ContentMD5;
-
-                Console.WriteLine($"Partial download supported: {partialDownloadSupported}");
-                Console.WriteLine($"Total file size: {totalFileSizeNullable?.ToString() ?? "Unknown"}");
-                Console.WriteLine($"Expected MD5 Hash available: {expectedMd5Hash != null}");
-
-                if (!totalFileSizeNullable.HasValue || totalFileSizeNullable.Value <= 0) // Allow 0 size files? No, treat as error.
+                else
                 {
-                    Console.WriteLine("Cannot determine file size or size is zero.");
-                    return false;
+                    long bytesToStartFrom = prerequisites.InitialBytesDownloaded > 0 ? 0 : prerequisites.InitialBytesDownloaded;
+                    if (prerequisites.InitialBytesDownloaded > 0) { _speedEstimator.Start(prerequisites.TotalFileSize, 0); ReportProgress(onProgressChanged, prerequisites.TotalFileSize, 0); }
+                    downloadAttemptSuccess = await PerformFullDownloadAsync(contentFileUrl, localFilePath, prerequisites.TotalFileSize, bytesToStartFrom, onProgressChanged, cancellationToken).ConfigureAwait(false);
                 }
-                totalFileSize = totalFileSizeNullable.Value;
-            } // headersResponse disposed here
+            }
+            finally { _speedEstimator.Stop(); }
 
-            // --- Resume Logic ---
+            if (!downloadAttemptSuccess)
+            {
+                Console.WriteLine($"[WARN] Download did not complete successfully for {localFilePath} (Perform* returned false).");
+                return false;
+            }
+
+            Console.WriteLine($"[INFO] Download stream copy completed for {localFilePath}. Verifying integrity...");
+            bool integrityResult = await VerifyIntegrityAsync(localFilePath, prerequisites.ExpectedMd5Hash, cancellationToken).ConfigureAwait(false);
+            if (!integrityResult) { Console.WriteLine($"[ERROR] Integrity check failed for {localFilePath}. File has been deleted."); return false; }
+            return true; // Success!
+        }
+        catch (OperationCanceledException ex) { _speedEstimator.Stop(); Console.WriteLine($"[WARN] Download operation cancelled for URL: {contentFileUrl}. Exception Type: {ex.GetType().Name}"); throw; }
+        catch (TimeoutException ex) { _speedEstimator.Stop(); Console.WriteLine($"[WARN] Download operation timed out for URL: {contentFileUrl}. Exception Type: {ex.GetType().Name}"); throw; }
+        catch (Exception ex) { _speedEstimator.Stop(); Console.WriteLine($"[ERROR] An unexpected error occurred during download process for URL {contentFileUrl}: {ex.Message}"); return false; }
+        finally { if (_speedEstimator != null) _speedEstimator.Stop(); }
+    }
+
+
+    private async Task<DownloadPrerequisites> GetDownloadPrerequisitesAsync(string contentFileUrl, string localFilePath, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"[DEBUG] Attempting to get headers for {contentFileUrl}");
+        HttpResponseMessage? headersResponse = null;
+        try
+        {
+            headersResponse = await ExecuteWithRetryAsync(
+                (token) => _webSystemCalls.GetHeadersAsync(contentFileUrl, token), // <<< Ensure lambda is here
+                $"GetHeaders ({contentFileUrl})",
+                cancellationToken).ConfigureAwait(false); // Can throw OCE/Timeout
+
+            if (headersResponse == null || !headersResponse.IsSuccessStatusCode) { /* ... handle failure ... */ return new DownloadPrerequisites(false, 0, null, false, 0, false); }
+
+            bool partialSupported = headersResponse.Headers.AcceptRanges.Contains("bytes");
+            long? totalSizeNullable = headersResponse.Content.Headers.ContentLength; byte[]? md5Hash = headersResponse.Content.Headers.ContentMD5;
+            Console.WriteLine($"[DEBUG] Headers received for {contentFileUrl}: PartialSupported={partialSupported}, Size={totalSizeNullable?.ToString() ?? "Unknown"}, MD5Present={md5Hash != null}");
+            if (!totalSizeNullable.HasValue || totalSizeNullable.Value < 0) { /* ... handle failure ... */ return new DownloadPrerequisites(false, 0, null, false, 0, false); }
+
+            long totalSize = totalSizeNullable.Value; long initialBytes = 0; bool restartRequired = false;
             if (File.Exists(localFilePath))
             {
                 try
                 {
-                    var existingFileInfo = new FileInfo(localFilePath);
-                    totalBytesDownloaded = existingFileInfo.Length;
-                    Console.WriteLine($"Existing file found with size: {totalBytesDownloaded} bytes.");
-
-                    if (totalBytesDownloaded >= totalFileSize)
+                    var fi = new FileInfo(localFilePath); initialBytes = fi.Length; Console.WriteLine($"[INFO] Existing file {localFilePath} found with size: {initialBytes} bytes.");
+                    if (initialBytes >= totalSize)
                     {
-                        if (totalBytesDownloaded == totalFileSize)
-                        {
-                            Console.WriteLine("Existing file size matches total file size. Checking integrity...");
-                            // Verify integrity even if file exists and seems complete
-                            bool integrityOk = await VerifyIntegrityAsync(localFilePath, expectedMd5Hash, cancellationToken);
-                            if (integrityOk)
-                            {
-                                Console.WriteLine("Integrity check passed for existing file. Assuming download complete.");
-                                ReportProgress(onProgressChanged, totalFileSize, totalBytesDownloaded); // Report final progress
-                                return true;
-                            }
-                            else
-                            {
-                                Console.WriteLine("Existing file failed integrity check. Deleting and restarting.");
-                                TryDeleteFile(localFilePath);
-                                totalBytesDownloaded = 0;
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Existing file size ({totalBytesDownloaded}) is larger than total size ({totalFileSize}). Deleting and restarting.");
-                            TryDeleteFile(localFilePath);
-                            totalBytesDownloaded = 0;
-                        }
+                        if (initialBytes == totalSize) { bool ok = md5Hash != null ? await VerifyIntegrityAsync(localFilePath, md5Hash, cancellationToken, logSkip: true).ConfigureAwait(false) : true; if (ok) return new DownloadPrerequisites(true, totalSize, md5Hash, partialSupported, totalSize, false); else { restartRequired = true; initialBytes = 0; } }
+                        else { restartRequired = true; initialBytes = 0; }
                     }
-                    else if (partialDownloadSupported) // Only resume if server supports it
-                    {
-                        Console.WriteLine($"Resuming download from byte {totalBytesDownloaded}.");
-                        // Set start bytes for speed calculation upon resume
-                        _startTimestampBytes = totalBytesDownloaded;
-                    }
-                    else // File exists, smaller, but server doesn't support partial. Restart.
-                    {
-                        Console.WriteLine("Partial download not supported by server, but smaller local file exists. Deleting local file and starting full download.");
-                        TryDeleteFile(localFilePath);
-                        totalBytesDownloaded = 0;
-                    }
+                    else if (!partialSupported) { restartRequired = true; initialBytes = 0; }
+                    else { Console.WriteLine($"[INFO] Resuming download from byte {initialBytes}."); }
                 }
-                catch (IOException ex)
-                {
-                    Console.WriteLine($"Error accessing existing file '{localFilePath}': {ex.Message}. Attempting to restart download.");
-                    TryDeleteFile(localFilePath);
-                    totalBytesDownloaded = 0;
-                }
+                catch (IOException ex) { Console.WriteLine($"[WARN] IO Error accessing existing file {localFilePath}: {ex.Message}. Marking for restart."); restartRequired = true; initialBytes = 0; }
+                catch (UnauthorizedAccessException ex) { Console.WriteLine($"[WARN] Access Denied accessing existing file {localFilePath}: {ex.Message}. Marking for restart."); restartRequired = true; initialBytes = 0; }
             }
-            // --- End Resume Logic ---
-
-            // Report initial progress (might be > 0 if resuming)
-            ReportProgress(onProgressChanged, totalFileSize, totalBytesDownloaded);
-
-            // Start stopwatch just before download loop/call
-            _stopwatch.Start();
-
-            bool downloadAttemptSuccess = false;
-            if (!partialDownloadSupported)
-            {
-                // Ensure we start clean if full download is needed but partial file existed
-                if (totalBytesDownloaded > 0)
-                {
-                    Console.WriteLine("Starting full download, but partial file existed. Overwriting.");
-                    _stopwatch.Restart(); // Restart timer for accurate speed
-                    _startTimestampBytes = 0;
-                    totalBytesDownloaded = 0;
-                    ReportProgress(onProgressChanged, totalFileSize, totalBytesDownloaded); // Reset progress report
-                }
-                downloadAttemptSuccess = await PerformFullDownloadAsync(contentFileUrl, localFilePath, totalFileSize, totalBytesDownloaded, onProgressChanged, cancellationToken);
-            }
-            else
-            {
-                // If not resuming (_startTimestampBytes == 0), set it now
-                if (_startTimestampBytes == 0) _startTimestampBytes = totalBytesDownloaded;
-                downloadAttemptSuccess = await PerformPartialDownloadAsync(contentFileUrl, localFilePath, totalFileSize, totalBytesDownloaded, onProgressChanged, cancellationToken);
-            }
-
-            _stopwatch.Stop(); // Stop after download attempt finishes or fails
-
-            if (downloadAttemptSuccess)
-            {
-                Console.WriteLine("Download stream copy completed. Verifying integrity...");
-                return await VerifyIntegrityAsync(localFilePath, expectedMd5Hash, cancellationToken);
-            }
-            else
-            {
-                Console.WriteLine("Download failed or was cancelled before completion.");
-                // Don't delete partial file on general failure/cancellation (allow resume) unless specific error requires it (handled in download methods)
-                return false;
-            }
+            return new DownloadPrerequisites(true, totalSize, md5Hash, partialSupported, initialBytes, restartRequired);
         }
-        catch (OperationCanceledException) // Catch cancellation during header check/setup phase
-        {
-            Console.WriteLine("Operation cancelled during download setup (e.g., header check).");
-            _stopwatch.Stop();
-            throw;
-        }
-        catch (Exception ex) // Catch other unexpected errors during setup
-        {
-            Console.WriteLine($"An unexpected error occurred during download setup: {ex.Message}");
-            _stopwatch.Stop();
-            return false;
-        }
+        // Let OCE/TimeoutException propagate
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Operation cancelled while getting prerequisites for {contentFileUrl}"); throw; }
+        catch (TimeoutException) { Console.WriteLine($"[WARN] Operation timed out while getting prerequisites for {contentFileUrl}"); throw; }
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error getting prerequisites for {contentFileUrl}: {ex.Message}"); return new DownloadPrerequisites(false, 0, null, false, 0, false); }
+        finally { headersResponse?.Dispose(); }
     }
 
-    // Modified to accept currentTotalBytesDownloaded
+
     private async Task<bool> PerformFullDownloadAsync(string contentFileUrl, string localFilePath, long totalFileSize, long currentTotalBytesDownloaded,
         Action<FileProgress> onProgressChanged, CancellationToken cancellationToken)
     {
-        Console.WriteLine("Attempting full download...");
-        HttpResponseMessage? contentResponse = null;
+        Console.WriteLine($"[INFO] Attempting full download for {contentFileUrl} to {localFilePath}");
+        HttpResponseMessage? contentResponse = null; FileStream? fileStream = null;
         try
         {
+            // ***** FIX: Restore missing lambda *****
             contentResponse = await ExecuteWithRetryAsync(
-                async (token) => await _webSystemCalls.DownloadContentAsync(contentFileUrl, token).ConfigureAwait(false),
-                "DownloadContent (Full)",
-                cancellationToken).ConfigureAwait(false);
+                (token) => _webSystemCalls.DownloadContentAsync(contentFileUrl, token), // <<< Ensure lambda is here
+                $"DownloadContent (Full - {contentFileUrl})",
+                cancellationToken).ConfigureAwait(false); // Can throw OCE/Timeout
 
-            if (contentResponse == null || !contentResponse.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"Failed to download content after retries. Status code: {contentResponse?.StatusCode}");
-                return false;
+            if (contentResponse == null || !contentResponse.IsSuccessStatusCode) { /* ... return false ... */ return false; }
+
+            long actualLength = contentResponse.Content.Headers.ContentLength ?? -1;
+            if (actualLength != totalFileSize && actualLength >= 0) { /* ... adjust totalFileSize ... */ totalFileSize = actualLength; _speedEstimator.Start(totalFileSize, currentTotalBytesDownloaded); }
+
+            Console.WriteLine($"[DEBUG] Writing {totalFileSize} bytes to file: {localFilePath}");
+            fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, _options.BufferSize, FileOptions.Asynchronous);
+            using (var contentStream = await contentResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+            { // Can throw OCE
+                var buffer = new byte[_options.BufferSize]; int bytesRead; long dlAttempt = 0;
+                while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+                { // Can throw OCE
+                    await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false); // Can throw OCE
+                    dlAttempt += bytesRead; ReportProgress(onProgressChanged, totalFileSize, currentTotalBytesDownloaded + dlAttempt);
+                }
+                await fileStream.FlushAsync(cancellationToken).ConfigureAwait(false); // Can throw OCE
             }
-
-            if (contentResponse.Content.Headers.ContentLength.HasValue && contentResponse.Content.Headers.ContentLength.Value != totalFileSize)
-            {
-                Console.WriteLine($"Warning: Actual content length ({contentResponse.Content.Headers.ContentLength.Value}) differs from header content length ({totalFileSize}). Using actual.");
-                totalFileSize = contentResponse.Content.Headers.ContentLength.Value;
-            }
-
-            Console.WriteLine($"Writing to file: {localFilePath}");
-            using var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
-            using var contentStream = await contentResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-
-            var buffer = new byte[BufferSize];
-            int bytesRead;
-            // Use the bytes downloaded passed into the function
-            long bytesDownloadedThisAttempt = 0;
-
-            while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
-            {
-                await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
-                bytesDownloadedThisAttempt += bytesRead;
-                // Report progress based on total downloaded so far
-                ReportProgress(onProgressChanged, totalFileSize, currentTotalBytesDownloaded + bytesDownloadedThisAttempt);
-            }
-            await fileStream.FlushAsync(cancellationToken);
-            Console.WriteLine("Full download stream copy complete.");
-            return true;
+            Console.WriteLine($"[INFO] Full download stream copy complete for {localFilePath}"); return true; // Success
         }
-        catch (IOException ex) { Console.WriteLine($"File system error during full download: {ex.Message}"); TryDeleteFile(localFilePath); return false; }
-        catch (OperationCanceledException) { Console.WriteLine("Cancellation occurred during full download stream copy."); TryDeleteFile(localFilePath); return false; }
-        finally { contentResponse?.Dispose(); }
+        catch (IOException ex) { Console.WriteLine($"[ERROR] File system error during full download to {localFilePath}: {ex.Message}"); return false; } // Return false on IO
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Cancellation occurred during full download stream copy for {localFilePath}."); throw; } // Re-throw OCE
+        catch (TimeoutException) { Console.WriteLine($"[WARN] Timeout occurred during full download for {contentFileUrl}."); throw; } // Re-throw Timeout
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during full download for {contentFileUrl}: {ex.Message}"); return false; } // Return false on unexpected
+        finally { fileStream?.Dispose(); if (cancellationToken.IsCancellationRequested) { TryDeleteFile(localFilePath); } contentResponse?.Dispose(); }
     }
 
-    // Modified to track total bytes downloaded correctly
+
     private async Task<bool> PerformPartialDownloadAsync(string contentFileUrl, string localFilePath, long totalFileSize,
         long initialBytesDownloaded, Action<FileProgress> onProgressChanged, CancellationToken cancellationToken)
     {
-        Console.WriteLine("Attempting partial download...");
-        long currentTotalBytesDownloaded = initialBytesDownloaded; // Use a local variable for tracking within this attempt
-        FileStream? fileStream = null;
-
+        Console.WriteLine($"[INFO] Attempting partial download/resume for {contentFileUrl} to {localFilePath} starting from {initialBytesDownloaded}");
+        long currentTotalBytesDownloaded = initialBytesDownloaded; FileStream? fileStream = null;
         try
         {
-            fileStream = new FileStream(localFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
-
+            fileStream = new FileStream(localFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, _options.BufferSize, FileOptions.Asynchronous);
             while (currentTotalBytesDownloaded < totalFileSize)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested(); // Check before chunk
+                long bytesRemaining = totalFileSize - currentTotalBytesDownloaded; long bytesToDownload = Math.Min(bytesRemaining, _options.ChunkSize); long rangeFrom = currentTotalBytesDownloaded; long rangeTo = rangeFrom + bytesToDownload - 1;
+                if (rangeFrom > rangeTo || rangeFrom >= totalFileSize) break;
 
-                long bytesRemaining = totalFileSize - currentTotalBytesDownloaded;
-                long bytesToDownload = Math.Min(bytesRemaining, DefaultChunkSize);
-                long rangeFrom = currentTotalBytesDownloaded;
-                long rangeTo = rangeFrom + bytesToDownload - 1;
+                long bytesReadThisChunk = await DownloadChunkAsync(fileStream, contentFileUrl, rangeFrom, rangeTo, totalFileSize, currentTotalBytesDownloaded, onProgressChanged, cancellationToken).ConfigureAwait(false); // Can throw OCE/Timeout
 
-                // Check if range is valid before making the call
-                if (rangeFrom > rangeTo || rangeFrom >= totalFileSize)
-                {
-                    Console.WriteLine($"Invalid range calculated ({rangeFrom}-{rangeTo}), total size {totalFileSize}. Assuming completion.");
-                    break; // Exit loop if range seems invalid
-                }
-
-                Console.WriteLine($"Requesting bytes {rangeFrom}-{rangeTo}");
-                HttpResponseMessage? partialResponse = null;
-                try
-                {
-                    partialResponse = await ExecuteWithRetryAsync(
-                        async (token) => await _webSystemCalls.DownloadPartialContentAsync(contentFileUrl, rangeFrom, rangeTo, token).ConfigureAwait(false),
-                        $"DownloadPartialContent ({rangeFrom}-{rangeTo})",
-                        cancellationToken).ConfigureAwait(false);
-
-                    if (partialResponse == null || (partialResponse.StatusCode != HttpStatusCode.PartialContent && partialResponse.StatusCode != HttpStatusCode.RequestedRangeNotSatisfiable))
-                    {
-                        Console.WriteLine($"Failed to download chunk {rangeFrom}-{rangeTo} after retries. Status code: {partialResponse?.StatusCode}");
-                        return false; // Chunk failed, abort attempt
-                    }
-
-                    if (partialResponse.StatusCode == HttpStatusCode.PartialContent)
-                    {
-                        fileStream.Seek(rangeFrom, SeekOrigin.Begin);
-                        using var partialContentStream = await partialResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-                        var buffer = new byte[BufferSize];
-                        int bytesRead;
-                        long bytesReadThisChunk = 0;
-                        while ((bytesRead = await partialContentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
-                        {
-                            await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
-                            bytesReadThisChunk += bytesRead;
-                            // Report progress based on total accumulated bytes
-                            ReportProgress(onProgressChanged, totalFileSize, currentTotalBytesDownloaded + bytesReadThisChunk);
-                        }
-                        currentTotalBytesDownloaded += bytesReadThisChunk; // Update total after chunk is fully processed
-                    }
-                    else if (partialResponse.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-                    {
-                        Console.WriteLine($"Server returned 416 Range Not Satisfiable for range {rangeFrom}-{rangeTo}. Assuming download already complete based on server response.");
-                        // Update progress to 100% based on server feedback
-                        ReportProgress(onProgressChanged, totalFileSize, totalFileSize);
-                        currentTotalBytesDownloaded = totalFileSize; // Assume complete
-                        break; // Exit loop
-                    }
-                }
-                finally { partialResponse?.Dispose(); }
-
-            } // End while loop
-
-            if (fileStream != null) await fileStream.FlushAsync(cancellationToken);
-            Console.WriteLine("Partial download stream copy loop finished.");
-            // Final check based on whether we reached the total size
-            return currentTotalBytesDownloaded >= totalFileSize;
+                if (bytesReadThisChunk < 0) return false; // Chunk failed, keep partial
+                else if (bytesReadThisChunk == 0 && currentTotalBytesDownloaded < totalFileSize) { currentTotalBytesDownloaded = totalFileSize; break; } // Assume complete
+                currentTotalBytesDownloaded += bytesReadThisChunk; Console.WriteLine($"[TRACE] Chunk {rangeFrom}-{rangeTo} downloaded. Total downloaded: {currentTotalBytesDownloaded}");
+            }
+            if (fileStream != null) await fileStream.FlushAsync(cancellationToken).ConfigureAwait(false); // Can throw OCE
+            Console.WriteLine($"[INFO] Partial download stream copy loop finished for {localFilePath}. Total bytes: {currentTotalBytesDownloaded}");
+            if (currentTotalBytesDownloaded < totalFileSize) { Console.WriteLine($"[WARN] Partial download loop finished for {localFilePath}, but downloaded bytes ({currentTotalBytesDownloaded}) is less than total size ({totalFileSize})."); return false; }
+            return true; // Completed successfully
         }
-        catch (IOException ex) { Console.WriteLine($"File system error during partial download: {ex.Message}"); return false; }
-        catch (OperationCanceledException) { Console.WriteLine("Cancellation occurred during partial download stream copy."); return false; /* Keep partial file */ }
+        catch (IOException ex) { Console.WriteLine($"[ERROR] File system error during partial download to {localFilePath}: {ex.Message}"); return false; } // Keep partial
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Cancellation occurred during partial download setup or loop for {localFilePath}. Keeping partial file."); throw; } // Re-throw OCE
+        catch (TimeoutException) { Console.WriteLine($"[WARN] Timeout occurred during partial download for {contentFileUrl}. Keeping partial file."); throw; } // Re-throw Timeout
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during partial download for {contentFileUrl}: {ex.Message}"); return false; } // Keep partial
         finally { fileStream?.Dispose(); }
     }
 
-    private void ReportProgress(Action<FileProgress> onProgressChanged, long totalFileSize, long totalBytesDownloaded)
+
+    private async Task<long> DownloadChunkAsync(FileStream fileStream, string url, long rangeFrom, long rangeTo, long totalFileSize, long currentTotalBeforeChunk, Action<FileProgress> onProgressChanged, CancellationToken cancellationToken)
     {
-        double? progressPercent = null;
-        if (totalFileSize > 0)
-        {
-            progressPercent = Math.Max(0.0, Math.Min(100.0, (double)totalBytesDownloaded / totalFileSize * 100.0));
-        }
-
-        TimeSpan? estimatedRemaining = null;
-        // Check stopwatch *before* accessing Elapsed
-        if (_stopwatch.IsRunning && totalFileSize > 0 && totalBytesDownloaded > _startTimestampBytes)
-        {
-            double elapsedSeconds = _stopwatch.Elapsed.TotalSeconds;
-
-            // Only calculate if some meaningful time has passed and bytes downloaded
-            if (elapsedSeconds > 0.1)
-            // -------------------------
-            {
-                long bytesSinceStart = totalBytesDownloaded - _startTimestampBytes;
-                // Ensure bytesSinceStart is positive before division
-                if (bytesSinceStart > 0)
-                {
-                    double bytesPerSecond = bytesSinceStart / elapsedSeconds;
-
-                    // Avoid division by zero or tiny/negative speeds, report only for meaningful speed
-                    if (bytesPerSecond > 1)
-                    {
-                        long remainingBytes = totalFileSize - totalBytesDownloaded;
-                        if (remainingBytes > 0)
-                        {
-                            // Use try-catch for potential overflow if remainingBytes / bytesPerSecond is huge
-                            try
-                            {
-                                estimatedRemaining = TimeSpan.FromSeconds(remainingBytes / bytesPerSecond);
-                            }
-                            catch (OverflowException)
-                            {
-                                // If time is huge, report TimeSpan.MaxValue or just null
-                                estimatedRemaining = TimeSpan.MaxValue;
-                            }
-                        }
-                        else
-                        {
-                            // If no bytes remaining, estimate is zero
-                            estimatedRemaining = TimeSpan.Zero;
-                        }
-                    }
-                }
-            }
-        }
-        // Pass calculated value, default to Zero if null
-        onProgressChanged?.Invoke(new FileProgress(totalFileSize, totalBytesDownloaded, progressPercent, estimatedRemaining ?? TimeSpan.Zero));
-    }
-
-    private async Task<bool> VerifyIntegrityAsync(string localFilePath, byte[]? expectedMd5Hash, CancellationToken cancellationToken)
-    {
-        if (expectedMd5Hash == null)
-        {
-            Console.WriteLine("Warning: No MD5 hash provided in headers. Skipping integrity check.");
-            return true;
-        }
+        Console.WriteLine($"[DEBUG] Requesting chunk {rangeFrom}-{rangeTo} for {url}");
+        HttpResponseMessage? partialResponse = null;
         try
         {
-            Console.WriteLine("Calculating MD5 hash for downloaded file...");
-            byte[] calculatedHash;
-            using (var md5 = MD5.Create())
-            using (var fileStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, useAsync: true))
-            {
-                calculatedHash = await md5.ComputeHashAsync(fileStream, cancellationToken).ConfigureAwait(false);
-            }
+            // ***** FIX: Restore missing lambda *****
+            partialResponse = await ExecuteWithRetryAsync(
+                (token) => _webSystemCalls.DownloadPartialContentAsync(url, rangeFrom, rangeTo, token), // <<< Ensure lambda is here
+                $"DownloadPartialContent ({rangeFrom}-{rangeTo} - {url})",
+                cancellationToken).ConfigureAwait(false); // Can throw OCE/TimeoutException
 
-            if (expectedMd5Hash.SequenceEqual(calculatedHash))
+            if (partialResponse == null || (!partialResponse.IsSuccessStatusCode && partialResponse.StatusCode != HttpStatusCode.RequestedRangeNotSatisfiable)) return -1; // Failed after retry
+            if (partialResponse.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) return 0; // Assume complete
+
+            if (partialResponse.StatusCode == HttpStatusCode.PartialContent)
             {
-                Console.WriteLine("Integrity check passed: MD5 hashes match.");
-                return true;
+                Console.WriteLine($"[TRACE] Received 206 Partial Content for chunk {rangeFrom}-{rangeTo} for {url}. Writing to stream."); cancellationToken.ThrowIfCancellationRequested();
+                fileStream.Seek(rangeFrom, SeekOrigin.Begin); // Can throw IO
+                using (var partialContentStream = await partialResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+                { // Can throw OCE
+                    var buffer = new byte[_options.BufferSize]; int bytesRead; long bytesReadThisChunk = 0;
+                    while ((bytesRead = await partialContentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+                    { // Can throw OCE
+                        cancellationToken.ThrowIfCancellationRequested(); await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false); // Can throw OCE, IO
+                        bytesReadThisChunk += bytesRead; ReportProgress(onProgressChanged, totalFileSize, currentTotalBeforeChunk + bytesReadThisChunk);
+                    }
+                    Console.WriteLine($"[TRACE] Finished writing {bytesReadThisChunk} bytes for chunk {rangeFrom}-{rangeTo} for {url}."); return bytesReadThisChunk; // Success
+                }
             }
-            else
-            {
-                Console.WriteLine("Integrity check failed: MD5 hashes do not match!");
-                Console.WriteLine($"Expected:   {BitConverter.ToString(expectedMd5Hash).Replace("-", "")}");
-                Console.WriteLine($"Calculated: {BitConverter.ToString(calculatedHash).Replace("-", "")}");
-                TryDeleteFile(localFilePath);
-                return false;
-            }
+            else { return -1; } // Unexpected status
         }
-        catch (IOException ex) { Console.WriteLine($"Error reading file for integrity check: {ex.Message}"); return false; }
-        catch (OperationCanceledException) { Console.WriteLine("Operation cancelled during integrity check."); return false; }
-        catch (Exception ex) { Console.WriteLine($"Unexpected error during integrity check: {ex.Message}"); return false; }
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Operation cancelled during processing of chunk {rangeFrom}-{rangeTo} for {url}"); throw; } // Re-throw OCE
+        catch (TimeoutException) { Console.WriteLine($"[WARN] Timeout occurred downloading chunk {rangeFrom}-{rangeTo} for {url}"); throw; } // Re-throw Timeout
+        catch (IOException ex) { Console.WriteLine($"[ERROR] IO error processing chunk {rangeFrom}-{rangeTo} for {url}: {ex.Message}"); return -1; } // Return -1 on IO
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error downloading chunk {rangeFrom}-{rangeTo} for {url}: {ex.Message}"); return -1; } // Return -1 on unexpected
+        finally { partialResponse?.Dispose(); }
     }
+
+
+    private void ReportProgress(Action<FileProgress> onProgressChanged, long totalFileSize, long totalBytesDownloaded)
+    {
+        // Unchanged
+        totalBytesDownloaded = Math.Min(totalBytesDownloaded, totalFileSize); _speedEstimator.UpdateBytesDownloaded(totalBytesDownloaded);
+        double? progressPercent = (totalFileSize > 0) ? Math.Max(0.0, Math.Min(100.0, (double)totalBytesDownloaded / totalFileSize * 100.0)) : (totalBytesDownloaded > 0 ? (double?)null : 0.0);
+        TimeSpan? estimatedRemaining = _speedEstimator.EstimateRemainingTime();
+        try { onProgressChanged?.Invoke(new FileProgress(totalFileSize, totalBytesDownloaded, progressPercent, estimatedRemaining)); }
+        catch (Exception ex) { Console.WriteLine($"[WARN] Error occurred within the onProgressChanged callback: {ex.Message}"); }
+    }
+
+
+    private async Task<bool> VerifyIntegrityAsync(string localFilePath, byte[]? expectedMd5Hash, CancellationToken cancellationToken, bool logSkip = false)
+    {
+        // This method correctly re-throws OCE
+        if (expectedMd5Hash == null) { if (!logSkip) Console.WriteLine($"[INFO] MD5 header not provided. Skipping integrity check for {localFilePath}."); return true; }
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested(); // Check before
+            if (!logSkip) Console.WriteLine($"[INFO] Calculating MD5 hash for {localFilePath}"); byte[] calculatedHash;
+            using (var md5 = MD5.Create()) using (var fs = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, _options.BufferSize, FileOptions.Asynchronous)) { calculatedHash = await md5.ComputeHashAsync(fs).ConfigureAwait(false); }
+            cancellationToken.ThrowIfCancellationRequested(); // Check after
+            if (expectedMd5Hash.SequenceEqual(calculatedHash)) { if (!logSkip) Console.WriteLine($"[INFO] Integrity check passed for {localFilePath}: MD5 hashes match."); return true; }
+            else { if (!logSkip) { Console.WriteLine($"[ERROR] Integrity check failed for {localFilePath}: MD5 hashes do not match!"); Console.WriteLine($"Expected: {BitConverter.ToString(expectedMd5Hash).Replace("-", "")}"); Console.WriteLine($"Calculated: {BitConverter.ToString(calculatedHash).Replace("-", "")}"); TryDeleteFile(localFilePath); } return false; }
+        }
+        catch (IOException ex) { Console.WriteLine($"[ERROR] IO Error reading file {localFilePath} for integrity check: {ex.Message}"); return false; }
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Operation cancelled during integrity check for {localFilePath}."); throw; } // Re-throw
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during integrity check for {localFilePath}: {ex.Message}"); return false; }
+    }
+
 
     private async Task<HttpResponseMessage?> ExecuteWithRetryAsync(
              Func<CancellationToken, Task<HttpResponseMessage>> action,
              string operationName,
              CancellationToken cancellationToken)
     {
-        TimeSpan currentDelay = _initialRetryDelay;
-        int maxAttempts = _maxRetries;
-
-        for (int attempt = 0; attempt <= maxAttempts; attempt++)
+        // This method correctly re-throws OCE/TimeoutException
+        TimeSpan currentDelay = _options.InitialRetryDelay; HttpResponseMessage? response = null;
+        for (int attempt = 0; attempt <= _options.MaxRetries; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            HttpResponseMessage? response = null; // Keep response scoped within loop iteration
             try
             {
-                if (attempt > 0)
-                {
-                    Console.WriteLine($"Retrying {operationName} (attempt {attempt}/{maxAttempts}). Waiting {currentDelay.TotalSeconds}s...");
-                    await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false);
-                    currentDelay = TimeSpan.FromSeconds(Math.Min(currentDelay.TotalSeconds * 2, _maxRetryDelay.TotalSeconds));
-                }
-
-                response = await action(cancellationToken).ConfigureAwait(false);
-
-                // Success or specific non-retriable codes (like 416) - RETURN without disposing
-                if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-                {
-                    // Let the caller handle disposal of the successful/handled response
-                    return response;
-                }
-
-                // Decide if status code is worth retrying
-                bool shouldRetryStatusCode = response.StatusCode >= HttpStatusCode.InternalServerError ||
-                                             response.StatusCode == HttpStatusCode.RequestTimeout || // 408
-                                             response.StatusCode == HttpStatusCode.TooManyRequests; // 429
-
-                if (!shouldRetryStatusCode)
-                {
-                    Console.WriteLine($"{operationName} failed on attempt {attempt} with non-retriable status code {response.StatusCode}.");
-                    // Let the caller handle disposal of the non-retried failed response
-                    return response;
-                }
-
-                Console.WriteLine($"{operationName} failed on attempt {attempt} with retriable status code {response.StatusCode}.");
-
-                // Dispose *only* if we are going to retry (i.e., not the last attempt)
-                if (attempt < maxAttempts)
-                {
-                    response.Dispose();
-                    // Set response to null after disposal to avoid potential issues if catch block runs later
-                    response = null;
-                }
-                else
-                {
-                    // Return the failed response after max retries - let caller dispose
-                    return response;
-                }
+                if (attempt > 0) { await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false); currentDelay = TimeSpan.FromSeconds(Math.Min(currentDelay.TotalSeconds * 2, _options.MaxRetryDelay.TotalSeconds)); }
+                Console.WriteLine($"[TRACE] Executing {operationName}, attempt {attempt}"); response = await action(cancellationToken).ConfigureAwait(false); // Pass CT
+                if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) return response;
+                bool shouldRetry = response.StatusCode >= HttpStatusCode.InternalServerError || response.StatusCode == HttpStatusCode.RequestTimeout || response.StatusCode == HttpStatusCode.TooManyRequests;
+                if (!shouldRetry) return response; Console.WriteLine($"[WARN] {operationName} failed on attempt {attempt} with retriable status code {response.StatusCode}."); if (attempt < _options.MaxRetries) { response.Dispose(); response = null; }
             }
-            catch (HttpRequestException ex)
-            {
-                Console.WriteLine($"{operationName} failed on attempt {attempt} with network error: {ex.Message}");
-                response?.Dispose(); // Dispose if exception caught
-                if (attempt >= maxAttempts) throw; // Rethrow after max retries
-            }
-            catch (TaskCanceledException ex) when (ex.InnerException is TimeoutException)
-            {
-                Console.WriteLine($"{operationName} failed on attempt {attempt} due to timeout.");
-                response?.Dispose(); // Dispose if exception caught
-                if (attempt >= maxAttempts) throw; // Rethrow after max retries
-            }
-            // --- NO finally block here disposing the response ---
+            catch (HttpRequestException ex) { response?.Dispose(); response = null; if (attempt >= _options.MaxRetries) throw; Console.WriteLine($"[WARN] {operationName} failed on attempt {attempt} with network error: {ex.Message}"); }
+            catch (TaskCanceledException ex) when (ex.InnerException is TimeoutException || !cancellationToken.IsCancellationRequested) { response?.Dispose(); response = null; if (attempt >= _options.MaxRetries) throw new TimeoutException($"Operation '{operationName}' timed out after {_options.MaxRetries + 1} attempts.", ex); Console.WriteLine($"[WARN] {operationName} failed on attempt {attempt} due to a timeout: {ex.Message}"); }
+            catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested) { response?.Dispose(); Console.WriteLine($"[WARN] Operation cancelled by token during {operationName} on attempt {attempt}."); throw; }
+            catch (Exception ex) { response?.Dispose(); response = null; if (attempt >= _options.MaxRetries) throw; Console.WriteLine($"[ERROR] Unexpected error during {operationName} on attempt {attempt}: {ex.Message}"); }
         }
-        // This path should ideally not be reached if MaxRetries >= 0
-        Console.WriteLine($"Warning: {operationName} ExecuteWithRetryAsync loop completed without returning or throwing.");
-        return null;
+        return response;
     }
+
 
     private void TryDeleteFile(string filePath)
     {
-        try
-        {
-            if (File.Exists(filePath))
-            {
-                Console.WriteLine($"Attempting to delete file: {filePath}");
-                File.Delete(filePath);
-            }
-        }
-        catch (IOException ex) { Console.WriteLine($"Warning: Could not delete file '{filePath}': {ex.Message}"); }
-        catch (UnauthorizedAccessException ex) { Console.WriteLine($"Warning: No permission to delete file '{filePath}': {ex.Message}"); }
+        // Unchanged
+        try { if (File.Exists(filePath)) { Console.WriteLine($"[INFO] Attempting to delete file: {filePath}"); File.Delete(filePath); Console.WriteLine($"[DEBUG] Successfully deleted file: {filePath}"); } }
+        catch (IOException ex) { Console.WriteLine($"[WARN] Could not delete file '{filePath}': {ex.Message}"); }
+        catch (UnauthorizedAccessException ex) { Console.WriteLine($"[WARN] No permission to delete file '{filePath}': {ex.Message}"); }
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error deleting file '{filePath}': {ex.Message}"); }
     }
 }

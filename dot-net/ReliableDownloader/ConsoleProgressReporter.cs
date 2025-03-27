@@ -1,6 +1,4 @@
-﻿using System;
-
-namespace ReliableDownloader
+﻿namespace ReliableDownloader
 {
     /// <summary>
     /// Handles reporting download progress to the console, reducing noise by only reporting whole percentage changes.

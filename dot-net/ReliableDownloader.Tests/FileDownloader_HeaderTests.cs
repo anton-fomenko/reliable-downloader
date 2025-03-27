@@ -2,7 +2,6 @@
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System.Net;
-using System.Net.Http.Headers;
 // Make sure your helper class namespace is accessible
 // using static ReliableDownloader.Tests.FileDownloaderTestHelper; // Optional
 
