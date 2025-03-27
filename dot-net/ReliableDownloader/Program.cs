@@ -1,10 +1,9 @@
 using ReliableDownloader;
 
-// Use top-level statements feature of modern C#
 var exampleUrl = args.Length > 0
     ? args[0]
     // If this url 404's, you can get a live one from https://installer.demo.accurx.com/chain/latest.json.
-    : "https://installer.demo.accurx.com/chain/4.22.50587.0/accuRx.Installer.Local.msi"; // Example URL
+    : "https://installer.demo.accurx.com/chain/4.22.50587.0/accuRx.Installer.Local.msi";
 
 var exampleFilePath = args.Length > 1
     ? args[1]
@@ -12,49 +11,43 @@ var exampleFilePath = args.Length > 1
 
 using var cts = new CancellationTokenSource();
 
-// Optional: Set a timeout based on the third argument (in milliseconds)
+// Optional: Set a timeout based on the third argument (milliseconds)
 if (args.Length > 2 && int.TryParse(args[2], out int milliseconds))
 {
     Console.WriteLine($"[INFO] Setting cancellation timeout: {milliseconds}ms");
-    cts.CancelAfter(TimeSpan.FromMilliseconds(milliseconds));
+    cts.CancelAfter(milliseconds);
 }
 
-// *** Instantiate the custom progress reporter ***
+// Setup progress reporting and downloader
 var progressReporter = new ConsoleProgressReporter();
+var fileDownloader = new FileDownloader(new WebSystemCalls()); // Uses default options
 
-// Instantiate the downloader (consider making retry params configurable here if needed)
-var fileDownloader = new FileDownloader(new WebSystemCalls()); // Using defaults or adjusted retry params
-
-Console.WriteLine($"[INFO] Starting download attempt for: {exampleUrl}");
-Console.WriteLine($"[INFO] Target file path: {exampleFilePath}");
+Console.WriteLine($"[INFO] Attempting download:");
+Console.WriteLine($"  URL: {exampleUrl}");
+Console.WriteLine($"  Output: {exampleFilePath}");
 
 bool didDownloadSuccessfully = false;
 try
 {
-    // *** Pass the reporter's method as the action ***
+    // Start the download
     didDownloadSuccessfully = await fileDownloader.TryDownloadFile(
         exampleUrl,
         exampleFilePath,
-        progressReporter.HandleProgress, // Use the instance method
+        progressReporter.HandleProgress, // Pass the reporter's method
         cts.Token);
 }
 catch (OperationCanceledException)
 {
-    Console.WriteLine("[WARN] Download operation was cancelled.");
-    didDownloadSuccessfully = false; // Ensure success is false if cancelled
+    Console.WriteLine("[WARN] Download cancelled.");
+    didDownloadSuccessfully = false;
 }
-catch (Exception ex) // Catch unexpected errors during the download call itself
+catch (Exception ex) // Catch unexpected errors
 {
     Console.WriteLine($"[FAIL] An unexpected error occurred: {ex.Message}");
-    // Consider logging the full exception ex here using a proper logger
     didDownloadSuccessfully = false;
 }
 
-Console.WriteLine($"[INFO] File download ended! Success: {didDownloadSuccessfully}");
+Console.WriteLine($"[INFO] Download {(didDownloadSuccessfully ? "succeeded" : "failed")}.");
 
-// Optional: Keep console open to see output if running from explorer
-// Console.WriteLine("Press any key to exit.");
-// Console.ReadKey();
-
-// Return non-zero exit code on failure for scripting
+// Return non-zero exit code on failure
 return didDownloadSuccessfully ? 0 : 1;
