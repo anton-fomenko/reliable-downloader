@@ -1,7 +1,7 @@
 ﻿using Moq;
 using NUnit.Framework;
-using System.Net; // Required for HttpResponseMessage, HttpStatusCode
-using System.Net.Http.Headers; // Required for ContentRangeHeaderValue
+using System.Net;
+using System.Net.Http.Headers;
 
 namespace ReliableDownloader.Tests
 {
@@ -27,16 +27,12 @@ namespace ReliableDownloader.Tests
             FileDownloaderTestHelper.TeardownTestEnvironment(_context);
         }
 
-        // =========================================
-        // Cancellation Tests
-        // =========================================
-
         [Test]
         public async Task TryDownloadFile_ShouldThrowTaskCanceled_WhenCancelledDuringHeaderCheck()
         {
             // Arrange
             var url = "http://cancellable-header.com/file.msi";
-            // Use helper for unique file path generation
+
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
             {
                 _context.MockWebCalls.Setup(w => w.GetHeadersAsync(url, It.IsAny<CancellationToken>()))
@@ -115,7 +111,6 @@ namespace ReliableDownloader.Tests
                 _context.Cts.Cancel();
 
                 // Assert
-                // ** MODIFIED: Expect TaskCanceledException/OperationCanceledException **
                 Assert.ThrowsAsync<TaskCanceledException>(async () => await downloadTask);
 
                 // Verify state *after* confirming the exception was thrown
@@ -128,7 +123,7 @@ namespace ReliableDownloader.Tests
         }
 
         [Test]
-        public async Task TryDownloadFile_ShouldThrowTaskCanceledAndKeepPartial_WhenCancelledDuringPartialDownload() // Renamed slightly
+        public async Task TryDownloadFile_ShouldThrowTaskCanceledAndKeepPartial_WhenCancelledDuringPartialDownload()
         {
             // Arrange
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
@@ -182,11 +177,10 @@ namespace ReliableDownloader.Tests
                 var downloadTask = _context.Sut.TryDownloadFile(url, uniqueTestFilePath, prog => FileDownloaderTestHelper.HandleProgress(_context, prog), _context.Cts.Token);
 
                 // Wait long enough for chunk 1 to finish and chunk 2's SlowStream to be active
-                await Task.Delay(250); // Adjust if needed based on delays
+                await Task.Delay(250);
                 _context.Cts.Cancel();
 
                 // Assert
-                // ** MODIFIED: Expect TaskCanceledException/OperationCanceledException **
                 Assert.ThrowsAsync<TaskCanceledException>(async () => await downloadTask);
 
                 // Verify state *after* confirming the exception was thrown
