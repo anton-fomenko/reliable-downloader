@@ -10,9 +10,18 @@ internal sealed class FileDownloader : IFileDownloader
     private const int BufferSize = 81920;
     private const long DefaultChunkSize = 1 * 1024 * 1024;
 
-    private const int DefaultMaxRetries = 5;
+
+    //With these default settings, the delays between retries would be(using exponential backoff capped at 60s):
+    //1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, 60s, 60s, 60s, 60s, 60s, 60s, 60s
+    //(There are 15 delays corresponding to the 15 retries).
+
+    //Total Maximum Wait Time(Sum of Delays):
+    //1 + 2 + 4 + 8 + 16 + 32 + (9 * 60)
+    //= 63 + 540
+    //= 603 seconds (10 minutes)
+    private const int DefaultMaxRetries = 15;
     private readonly TimeSpan DefaultInitialRetryDelay = TimeSpan.FromSeconds(1);
-    private readonly TimeSpan DefaultMaxRetryDelay = TimeSpan.FromSeconds(30);
+    private readonly TimeSpan DefaultMaxRetryDelay = TimeSpan.FromSeconds(60);
 
     private readonly int _maxRetries;
     private readonly TimeSpan _initialRetryDelay;
