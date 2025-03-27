@@ -1,9 +1,14 @@
 using ReliableDownloader;
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks; // Required for Task
 
+// Use top-level statements feature of modern C#
 var exampleUrl = args.Length > 0
     ? args[0]
     // If this url 404's, you can get a live one from https://installer.demo.accurx.com/chain/latest.json.
-    : "https://installer.demo.accurx.com/chain/4.22.50587.0/accuRx.Installer.Local.msi";
+    : "https://installer.demo.accurx.com/chain/4.22.50587.0/accuRx.Installer.Local.msi"; // Example URL
 
 var exampleFilePath = args.Length > 1
     ? args[1]
@@ -11,43 +16,49 @@ var exampleFilePath = args.Length > 1
 
 using var cts = new CancellationTokenSource();
 
-if (args.Length > 2)
+// Optional: Set a timeout based on the third argument (in milliseconds)
+if (args.Length > 2 && int.TryParse(args[2], out int milliseconds))
 {
-    cts.CancelAfter(TimeSpan.FromMilliseconds(int.Parse(args[2])));
+    Console.WriteLine($"[INFO] Setting cancellation timeout: {milliseconds}ms");
+    cts.CancelAfter(TimeSpan.FromMilliseconds(milliseconds));
 }
 
-var fileDownloader = new FileDownloader(new WebSystemCalls());
+// *** Instantiate the custom progress reporter ***
+var progressReporter = new ConsoleProgressReporter();
 
-int lastReportedPercentage = -1; // Track the last reported whole percentage
+// Instantiate the downloader (consider making retry params configurable here if needed)
+var fileDownloader = new FileDownloader(new WebSystemCalls()); // Using defaults or adjusted retry params
 
-var didDownloadSuccessfully = await fileDownloader.TryDownloadFile(
-    exampleUrl,
-    exampleFilePath,
-    progress =>
-    {
-        if (progress.ProgressPercent.HasValue && progress.ProgressPercent.Value >= 0)
-        {
-            int currentPercentage = (int)Math.Floor(progress.ProgressPercent.Value);
-            // Only print if it's a new whole percentage point (or the first report)
-            if (currentPercentage > lastReportedPercentage)
-            {
-                Console.WriteLine($"[PROGRESS] {currentPercentage}% complete. Estimated time remaining: {progress.EstimatedRemaining?.ToString(@"hh\:mm\:ss") ?? "Calculating..."}");
-                lastReportedPercentage = currentPercentage;
-            }
-            // Ensure 100% completion is always reported
-            else if (progress.ProgressPercent.Value == 100 && lastReportedPercentage != 100)
-            {
-                Console.WriteLine($"[PROGRESS] {progress.ProgressPercent.Value}% complete. Download finished.");
-                lastReportedPercentage = 100;
-            }
-        }
-        // Handle case where percentage might not be calculated yet
-        else if (lastReportedPercentage == -1) // Only report initial state once
-        {
-            Console.WriteLine($"[PROGRESS] Starting download (Size: {progress.TotalFileSize ?? 0} bytes)...");
-            lastReportedPercentage = 0; // Mark initial message as sent
-        }
-    },
-    cts.Token);
+Console.WriteLine($"[INFO] Starting download attempt for: {exampleUrl}");
+Console.WriteLine($"[INFO] Target file path: {exampleFilePath}");
 
-Console.WriteLine($"File download ended! Success: {didDownloadSuccessfully}");
+bool didDownloadSuccessfully = false;
+try
+{
+    // *** Pass the reporter's method as the action ***
+    didDownloadSuccessfully = await fileDownloader.TryDownloadFile(
+        exampleUrl,
+        exampleFilePath,
+        progressReporter.HandleProgress, // Use the instance method
+        cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("[WARN] Download operation was cancelled.");
+    didDownloadSuccessfully = false; // Ensure success is false if cancelled
+}
+catch (Exception ex) // Catch unexpected errors during the download call itself
+{
+    Console.WriteLine($"[FAIL] An unexpected error occurred: {ex.Message}");
+    // Consider logging the full exception ex here using a proper logger
+    didDownloadSuccessfully = false;
+}
+
+Console.WriteLine($"[INFO] File download ended! Success: {didDownloadSuccessfully}");
+
+// Optional: Keep console open to see output if running from explorer
+// Console.WriteLine("Press any key to exit.");
+// Console.ReadKey();
+
+// Return non-zero exit code on failure for scripting
+return didDownloadSuccessfully ? 0 : 1;
