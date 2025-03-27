@@ -2,18 +2,13 @@
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System.Net;
-// Make sure your helper class namespace is accessible
-// using static ReliableDownloader.Tests.FileDownloaderTestHelper; // Optional
 
 namespace ReliableDownloader.Tests
 {
     [TestFixture]
-    public class FileDownloader_HeaderTests // No inheritance needed
+    public class FileDownloader_HeaderTests
     {
-        // Store the context returned by the helper
         private FileDownloaderTestHelper.TestContextData _context = null!;
-
-        // Keep test-specific fields if needed
         private readonly string _defaultTestFilePath = "test_download_header.msi";
 
         [SetUp]
