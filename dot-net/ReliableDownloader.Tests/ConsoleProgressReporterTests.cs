@@ -33,11 +33,6 @@ namespace ReliableDownloader.Tests
             _reporter.HandleProgress(progress); // Should report 0%
 
             Assert.That(_outputLines.Count, Is.EqualTo(1));
-            // The initial call logs "Starting...", the logic transitions _lastReportedPercentage to 0
-            // If 0% is explicitly sent AND _lastReportedPercentage is already 0, it shouldn't log again
-            // Let's adjust: If it's the first call AND percentage is 0, it should still log 0%
-            // Re-evaluating: The current logic logs "Starting..." on the *first* call if % is null OR if _lastReported is -1.
-            // Then it sets _lastReported to 0. Let's test this flow.
             _reporter.HandleProgress(new FileProgress(1000, 0, 0.5, TimeSpan.Zero)); // Send 0.5% -> Logs 0%
 
             Assert.That(_outputLines.Count, Is.EqualTo(1)); // Should only log once (the 0% line)
@@ -113,13 +108,9 @@ namespace ReliableDownloader.Tests
         [Test]
         public void HandleProgress_ShowsCalculating_WhenTimeRemainingIsZero()
         {
-            // Zero time remaining should likely show 00:00:00 or similar, not calculating
-            // Let's test the current behaviour which might show calculating for zero
-            // Update: The code was adjusted to show Calculating... only if > TimeSpan.Zero check fails
             _reporter.HandleProgress(new FileProgress(10000, 5000, 50.0, TimeSpan.Zero));
 
             Assert.That(_outputLines.Count, Is.EqualTo(1));
-            // Depending on exact logic, could be Calculating... or 00:00:00. Current code results in Calculating...
             Assert.That(_outputLines[0], Does.Contain("Estimated time remaining: Calculating..."));
         }
 
