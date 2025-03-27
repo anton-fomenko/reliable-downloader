@@ -76,7 +76,7 @@ namespace ReliableDownloader.Tests
 
 
         [Test]
-        public async Task TryDownloadFile_ShouldThrowTaskCanceledAndCleanup_WhenCancelledDuringFullDownload() // Renamed slightly
+        public async Task TryDownloadFile_ShouldThrowTaskCanceledAndCleanup_WhenCancelledDuringFullDownload()
         {
             // Arrange
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
