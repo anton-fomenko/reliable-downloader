@@ -337,7 +337,6 @@ internal sealed class FileDownloader : IFileDownloader
         }
     }
 
-    // ... (Rest of the methods remain the same) ...
     private async Task<bool> PerformPartialDownloadAsync(string contentFileUrl, string localFilePath, long totalFileSize,
     long initialBytesDownloaded, Action<FileProgress> onProgressChanged, CancellationToken cancellationToken)
     {
@@ -437,7 +436,6 @@ internal sealed class FileDownloader : IFileDownloader
         catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during partial download for {contentFileUrl}: {ex.Message}"); return false; } // Keep partial file
         finally { fileStream?.Dispose(); } // Dispose if not already disposed
     }
-
 
     private async Task<long> DownloadChunkAsync(FileStream fileStream, string url, long rangeFrom, long rangeTo, long totalFileSize, long currentTotalBeforeChunk, Action<FileProgress> onProgressChanged, CancellationToken cancellationToken)
     {
@@ -611,7 +609,6 @@ internal sealed class FileDownloader : IFileDownloader
         catch (OperationCanceledException) { Console.WriteLine($"[WARN] Operation cancelled during integrity check for {localFilePath}."); throw; } // Re-throw
         catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during integrity check for {localFilePath}: {ex.Message}"); return false; }
     }
-
 
     private async Task<HttpResponseMessage?> ExecuteWithRetryAsync(
             Func<CancellationToken, Task<HttpResponseMessage>> action,
