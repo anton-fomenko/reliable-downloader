@@ -3,7 +3,7 @@
 namespace ReliableDownloader
 {
     /// <summary>
-    /// Helper to estimate download speed and remaining time.
+    /// Estimates download speed and remaining time.
     /// </summary>
     internal class DownloadSpeedEstimator
     {
@@ -21,7 +21,7 @@ namespace ReliableDownloader
         {
             _totalFileSize = totalFileSize;
             _totalBytesDownloaded = initialBytesDownloaded;
-            _startTimestampBytes = initialBytesDownloaded; // Record bytes at the moment timing starts
+            _startTimestampBytes = initialBytesDownloaded;
             _stopwatch.Restart();
         }
 
@@ -45,40 +45,32 @@ namespace ReliableDownloader
         /// <summary>
         /// Estimates the remaining download time based on progress since Start was called.
         /// </summary>
-        /// <returns>An estimated TimeSpan, TimeSpan.Zero if complete, TimeSpan.MaxValue if potentially infinite, or null if estimation is not possible.</returns>
+        /// <returns>An estimated TimeSpan, TimeSpan.Zero if complete, or null if estimation is not reliable yet.</returns>
         public TimeSpan? EstimateRemainingTime()
         {
-            if (!_stopwatch.IsRunning || _totalFileSize <= 0) return null; // Can't estimate if stopped or no total size
+            if (!_stopwatch.IsRunning || _totalFileSize <= 0) return null;
 
             double elapsedSeconds = _stopwatch.Elapsed.TotalSeconds;
-
-            // Need some time elapsed and progress made to make a reasonable estimate
             if (elapsedSeconds < 0.5) return null; // Avoid estimates based on very short intervals
 
             long bytesDownloadedSinceStart = _totalBytesDownloaded - _startTimestampBytes;
-
-            // If no bytes downloaded since start, cannot estimate speed
-            if (bytesDownloadedSinceStart <= 0) return null;
+            if (bytesDownloadedSinceStart <= 0) return null; // Cannot estimate speed if no progress
 
             double bytesPerSecond = bytesDownloadedSinceStart / elapsedSeconds;
-
-            // Avoid division by zero or extremely low speeds causing huge estimates
-            if (bytesPerSecond < 1) return null; // Effectively stalled or too slow to estimate reasonably
+            if (bytesPerSecond < 1) return null; // Effectively stalled or too slow
 
             long remainingBytes = _totalFileSize - _totalBytesDownloaded;
-
-            if (remainingBytes <= 0) return TimeSpan.Zero; // Download is complete or somehow exceeded total size
+            if (remainingBytes <= 0) return TimeSpan.Zero; // Complete
 
             try
             {
                 double secondsRemaining = remainingBytes / bytesPerSecond;
 
-                // Check for potential overflow before converting to TimeSpan
+                // Cap estimate to avoid excessively large values due to low speed
                 if (secondsRemaining > TimeSpan.MaxValue.TotalSeconds)
                 {
-                    return TimeSpan.MaxValue; // Indicate a very long time (effectively infinite)
+                    return TimeSpan.MaxValue; // Effectively infinite
                 }
-                // Check for negative results which shouldn't happen with checks above, but be safe
                 if (secondsRemaining < 0)
                 {
                     return TimeSpan.Zero;
@@ -88,8 +80,7 @@ namespace ReliableDownloader
             }
             catch (OverflowException)
             {
-                // Handle potential overflow during calculation (less likely with double but possible)
-                return TimeSpan.MaxValue;
+                return TimeSpan.MaxValue; // Handle potential overflow
             }
         }
     }
