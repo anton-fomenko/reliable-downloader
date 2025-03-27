@@ -5,8 +5,8 @@
     /// </summary>
     internal sealed class ConsoleProgressReporter
     {
-        private int _lastReportedPercentage = -1; // -1 indicates initial state, 0 means 0% has been reported
-        private readonly Action<string> _outputWriter; // Action to allow injecting console output for testing
+        private int _lastReportedPercentage = -1; // Initial state
+        private readonly Action<string> _outputWriter;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ConsoleProgressReporter"/> class.
@@ -18,6 +18,7 @@
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ConsoleProgressReporter"/> class with a specific output writer.
+        /// Used primarily for testing.
         /// </summary>
         /// <param name="outputWriter">The action to call for writing output lines.</param>
         /// <exception cref="ArgumentNullException">Thrown if outputWriter is null.</exception>
@@ -37,14 +38,13 @@
             {
                 int currentPercentage = (int)Math.Floor(progress.ProgressPercent.Value);
 
-                // Only report if it's a new whole percentage point
-                if (currentPercentage > _lastReportedPercentage)
+                // Only report if it's a new whole percentage point or exactly 100%
+                if (currentPercentage > _lastReportedPercentage || (currentPercentage == 100 && _lastReportedPercentage != 100))
                 {
                     string timeString = progress.EstimatedRemaining.HasValue && progress.EstimatedRemaining.Value > TimeSpan.Zero
                         ? progress.EstimatedRemaining.Value.ToString(@"hh\:mm\:ss")
                         : "Calculating...";
 
-                    // Special message for 100%
                     if (currentPercentage >= 100)
                     {
                         _outputWriter($"[PROGRESS] 100% complete. Download finished.");
@@ -55,18 +55,12 @@
                     }
                     _lastReportedPercentage = currentPercentage;
                 }
-                // Handle edge case where 100% might be reported slightly after the last whole number update if file size is small
-                else if (progress.ProgressPercent.Value == 100 && _lastReportedPercentage != 100)
-                {
-                    _outputWriter($"[PROGRESS] 100% complete. Download finished.");
-                    _lastReportedPercentage = 100;
-                }
             }
             // Handle case where percentage might not be calculated yet (report initial state once)
             else if (_lastReportedPercentage == -1)
             {
                 _outputWriter($"[PROGRESS] Starting download (Size: {progress.TotalFileSize ?? 0} bytes)...");
-                _lastReportedPercentage = 0; // Mark initial message as sent, represents 0% reported state
+                _lastReportedPercentage = 0; // Mark initial message as sent
             }
         }
     }
