@@ -25,7 +25,6 @@ internal sealed class FileDownloader : IFileDownloader
     {
         _webSystemCalls = webSystemCalls ?? throw new ArgumentNullException(nameof(webSystemCalls));
         _options = options ?? new FileDownloaderOptions();
-        // Constructor logging removed for cleaner appearance
     }
 
     /// <inheritdoc />
@@ -116,24 +115,23 @@ internal sealed class FileDownloader : IFileDownloader
         {
             _speedEstimator.Stop();
             Console.WriteLine($"[WARN] Download operation cancelled for {contentFileUrl}.");
-            throw; // Re-throw OCE for the caller to handle
+            throw;
         }
         catch (TimeoutException ex)
         {
             _speedEstimator.Stop();
             Console.WriteLine($"[WARN] Download operation timed out for {contentFileUrl}: {ex.Message}");
-            throw; // Re-throw TimeoutException
+            throw;
         }
         catch (Exception ex)
         {
             _speedEstimator.Stop();
             Console.WriteLine($"[ERROR] Unexpected error during download for {contentFileUrl}: {ex.Message}");
-            // Consider logging the full exception details here in a real application
             return false;
         }
         finally
         {
-            _speedEstimator.Stop(); // Ensure stopped
+            _speedEstimator.Stop();
         }
     }
 
@@ -250,7 +248,7 @@ internal sealed class FileDownloader : IFileDownloader
             if (contentResponse == null || !contentResponse.IsSuccessStatusCode)
             {
                 Console.WriteLine($"[ERROR] Full download failed for {contentFileUrl}. Status: {contentResponse?.StatusCode.ToString() ?? "Unknown"}");
-                if (File.Exists(localFilePath)) TryDeleteFile(localFilePath); // Cleanup on failure
+                if (File.Exists(localFilePath)) TryDeleteFile(localFilePath);
                 return false;
             }
 
@@ -286,22 +284,20 @@ internal sealed class FileDownloader : IFileDownloader
         catch (IOException ex)
         {
             Console.WriteLine($"[ERROR] File error during full download to {localFilePath}: {ex.Message}");
-            // Try-finally block handles disposal and cleanup
         }
         catch (OperationCanceledException)
         {
             Console.WriteLine($"[WARN] Cancellation during full download stream copy for {localFilePath}.");
-            throw; // Re-throw OCE
+            throw;
         }
         catch (TimeoutException)
         {
             Console.WriteLine($"[WARN] Timeout during full download for {contentFileUrl}.");
-            throw; // Re-throw TimeoutException
+            throw;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] Unexpected error during full download for {contentFileUrl}: {ex.Message}");
-            // Try-finally block handles disposal and cleanup
         }
         finally
         {
@@ -315,7 +311,7 @@ internal sealed class FileDownloader : IFileDownloader
                 TryDeleteFile(localFilePath);
             }
         }
-        return false; // Return false if any exception occurred (except OCE/Timeout which are re-thrown)
+        return false; // Return false if any exception occurred (except Cancellation/Timeout which are re-thrown)
     }
 
     private async Task<bool> PerformPartialDownloadAsync(string contentFileUrl, string localFilePath, long totalFileSize,
@@ -327,7 +323,6 @@ internal sealed class FileDownloader : IFileDownloader
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(localFilePath)!);
-            // Use Create if starting from 0, otherwise OpenOrCreate (could also use Open for resume)
             FileMode fileOpenMode = (initialBytesDownloaded == 0) ? FileMode.Create : FileMode.OpenOrCreate;
             fileStream = new FileStream(localFilePath, fileOpenMode, FileAccess.Write, FileShare.None, _options.BufferSize, FileOptions.Asynchronous);
 
@@ -364,10 +359,6 @@ internal sealed class FileDownloader : IFileDownloader
                 }
 
                 currentTotalBytesDownloaded += bytesReadThisChunk;
-                // Console.WriteLine($"[TRACE] Chunk {rangeFrom}-{rangeTo} complete ({bytesReadThisChunk} bytes). Total: {currentTotalBytesDownloaded}");
-
-                // Sanity check file stream position (optional, adds overhead)
-                // if (fileStream.Position != currentTotalBytesDownloaded) { ... handle discrepancy ... }
             }
 
             await fileStream.FlushAsync(cancellationToken);
@@ -388,10 +379,10 @@ internal sealed class FileDownloader : IFileDownloader
             Console.WriteLine($"[INFO] Partial download complete based on size ({finalSize} >= {totalFileSize}).");
             return true;
         }
-        catch (IOException ex) { Console.WriteLine($"[ERROR] File error during partial download to {localFilePath}: {ex.Message}"); return false; } // Keep partial
-        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Cancellation during partial download for {localFilePath}. Keeping partial file."); throw; } // Re-throw
-        catch (TimeoutException) { Console.WriteLine($"[WARN] Timeout during partial download for {contentFileUrl}. Keeping partial file."); throw; } // Re-throw
-        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during partial download for {contentFileUrl}: {ex.Message}"); return false; } // Keep partial
+        catch (IOException ex) { Console.WriteLine($"[ERROR] File error during partial download to {localFilePath}: {ex.Message}"); return false; }
+        catch (OperationCanceledException) { Console.WriteLine($"[WARN] Cancellation during partial download for {localFilePath}. Keeping partial file."); throw; } 
+        catch (TimeoutException) { Console.WriteLine($"[WARN] Timeout during partial download for {contentFileUrl}. Keeping partial file."); throw; } 
+        catch (Exception ex) { Console.WriteLine($"[ERROR] Unexpected error during partial download for {contentFileUrl}: {ex.Message}"); return false; }
         finally { fileStream?.Dispose(); }
     }
 
@@ -479,7 +470,7 @@ internal sealed class FileDownloader : IFileDownloader
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[WARN] Error in onProgressChanged callback: {ex.Message}"); // Don't let callback crash download
+            Console.WriteLine($"[WARN] Error in onProgressChanged callback: {ex.Message}");
         }
     }
 
@@ -557,13 +548,11 @@ internal sealed class FileDownloader : IFileDownloader
                     currentDelay = TimeSpan.FromSeconds(Math.Min(currentDelay.TotalSeconds * 2, _options.MaxRetryDelay.TotalSeconds));
                 }
 
-                // Console.WriteLine($"[TRACE] Executing {operationName}, attempt {attempt}");
                 response = await action(cancellationToken);
 
                 // Treat success or RangeNotSatisfiable (for chunks) as success here
                 if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
-                    // Console.WriteLine($"[TRACE] {operationName} succeeded attempt {attempt}, status {response.StatusCode}.");
                     return response;
                 }
 
@@ -624,7 +613,6 @@ internal sealed class FileDownloader : IFileDownloader
             {
                 Console.WriteLine($"[INFO] Deleting file: {filePath}");
                 File.Delete(filePath);
-                // Console.WriteLine($"[DEBUG] Deleted file: {filePath}"); // Optional debug confirmation
             }
         }
         catch (IOException ex) { Console.WriteLine($"[WARN] Failed to delete '{filePath}': {ex.Message}"); }
