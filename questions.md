@@ -2,12 +2,11 @@
 
 ## How did you approach solving the problem?
 
-The .NET solution uses a `FileDownloader` class implementing `IFileDownloader`. Key approaches include:
-* **Resilience:** Implemented retries with exponential backoff for network errors, configured to handle disconnections exceeding two minutes.
-* **Download Modes:** Supports partial downloads by checking `Accept-Ranges: bytes` and resuming from the correct offset if a partial file exists. Falls back to full download if ranges aren't supported or if the existing file is invalid (e.g., larger than server size), preferring to use the partial mechanism even for restarts from byte 0 where supported.
-* **Integrity:** Verifies downloads using the `Content-MD5` header provided by the server. The file is deleted if the MD5 check fails.
-* **Progress & Cancellation:** Uses a callback for progress updates (reported on whole percentage changes via `ConsoleProgressReporter`) and supports graceful cancellation via `CancellationToken`.
-* **Testing:** Leveraged interfaces (`IWebSystemCalls`) for mocking dependencies in unit tests, covering various success, failure, resume, and cancellation scenarios.
+* **Understanding Requirements:** I first thoroughly reviewed the README to grasp the core problem (reliable downloads over unreliable networks) and the specific functional requirements (resilience, partial/full download modes, integrity checks, progress reporting, cancellation). I also noted the non-functional requirements regarding code quality and testing.
+
+* **Modular Design & Key Decisions:** I aimed for a modular design to separate concerns. The core download logic resides in `FileDownloader`. Other distinct responsibilities were separated into helper classes: `ConsoleProgressReporter` for progress output, `DownloadSpeedEstimator` for calculating remaining time, and `FileDownloaderOptions` for configuration. Key decisions included: using a retry mechanism with exponential backoff for resilience; prioritizing partial downloads for efficiency, with logic for resumption and fallbacks; using `Content-MD5` for integrity checks; implementing progress via callbacks and cancellation using `CancellationToken`.
+
+* **Iterative Implementation & Testing:** Development followed an iterative, test-driven approach. I focused on implementing features incrementally, writing unit tests (using NUnit and Moq) for each piece of functionality alongside its implementation. This involved mocking `IWebSystemCalls` to simulate various scenarios and validate logic without network dependencies at each step. Within `FileDownloader`, the logic was further broken down into distinct methods for different stages like fetching prerequisites (`GetDownloadPrerequisitesAsync`), performing full (`PerformFullDownloadAsync`) and partial (`PerformPartialDownloadAsync`, `DownloadChunkAsync`) downloads, verifying integrity (`VerifyIntegrityAsync`), and handling retries (`ExecuteWithRetryAsync`), enhancing internal modularity.
 
 ## How did you verify your solution works correctly?
 
