@@ -1,51 +1,37 @@
 ﻿using Moq;
 using NUnit.Framework;
-using NUnit.Framework.Legacy; // Needed for CollectionAssert
+using NUnit.Framework.Legacy; 
 using System.Net;
-// Make sure your helper class namespace is accessible
-// using static ReliableDownloader.Tests.FileDownloaderTestHelper; // Optional
 
 namespace ReliableDownloader.Tests
 {
     [TestFixture]
-    public class FileDownloader_PartialDownloadTests // No inheritance needed
+    public class FileDownloader_PartialDownloadTests
     {
-        // Store the context returned by the helper
         private FileDownloaderTestHelper.TestContextData _context = null!;
 
         [SetUp]
         public void Setup()
         {
-            // Get the common setup from the helper
             _context = FileDownloaderTestHelper.SetupTestEnvironment();
-            // No specific additional setup needed for these tests beyond cleanup
         }
 
         [TearDown]
         public void Teardown()
         {
-            // Call the common teardown helper
             FileDownloaderTestHelper.TeardownTestEnvironment(_context);
         }
-
-        // =========================================
-        // Partial Download Tests
-        // =========================================
 
         [Test]
         public async Task TryDownloadFile_ShouldAttemptPartialDownload_WhenPartialSupportedAndHeadersPresent()
         {
-            // Verifies a single chunk success scenario
-            // Use static helper, passing context
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
             {
                 // Arrange
                 var url = "http://partial-support.com/file.msi";
-                int fileSize = 1024; // Smaller than DefaultTestChunkSize 
-                // Use static helper
+                int fileSize = 1024;
                 var testData = FileDownloaderTestHelper.GenerateTestData(fileSize);
 
-                // Use context mock and static helper
                 _context.MockWebCalls.Setup(w => w.GetHeadersAsync(url, _context.Cts.Token))
                              .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreateHeadersResponse(fileSize, true)));
 
@@ -68,32 +54,26 @@ namespace ReliableDownloader.Tests
         [Test]
         public async Task TryDownloadFile_ShouldPerformPartialDownload_InMultipleChunks_WhenSupported()
         {
-            // Use static helper, passing context
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
             {
                 // Arrange
                 var url = "http://multi-partial-support.com/file.msi";
-                // Use static helper constant
                 int fileSize = (int)(FileDownloaderTestHelper.DefaultTestChunkSize * 2.5); // Requires 3 chunks
-                // Use static helper
                 var testData = FileDownloaderTestHelper.GenerateTestData(fileSize);
 
                 _context.MockWebCalls.Setup(w => w.GetHeadersAsync(url, _context.Cts.Token))
                              .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreateHeadersResponse(fileSize, true)));
 
-                // Mock the partial download calls for each expected chunk
                 long currentPos = 0;
                 int expectedCalls = 0;
                 while (currentPos < fileSize)
                 {
-                    // Use static helper constant
                     long bytesToDownload = Math.Min(fileSize - currentPos, FileDownloaderTestHelper.DefaultTestChunkSize );
                     long rangeFrom = currentPos;
                     long rangeTo = rangeFrom + bytesToDownload - 1;
                     long currentRangeFrom = rangeFrom; // Capture loop variables
                     long currentRangeTo = rangeTo;
                     _context.MockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, currentRangeFrom, currentRangeTo, _context.Cts.Token))
-                                 // Use static helper
                                  .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreatePartialContentResponse(testData, currentRangeFrom, currentRangeTo)));
                     currentPos += bytesToDownload;
                     expectedCalls++;
@@ -125,16 +105,12 @@ namespace ReliableDownloader.Tests
         [Test]
         public async Task TryDownloadFile_ShouldResumePartialDownload_WhenFileExists()
         {
-            // Use static helper, passing context
             await FileDownloaderTestHelper.ExecuteWithUniqueFileAsync(_context, async uniqueTestFilePath =>
             {
                 // Arrange
                 var url = "http://resume-partial.com/file.msi";
-                // Use static helper constant
                 int fileSize = (int)(FileDownloaderTestHelper.DefaultTestChunkSize * 1.5); // Requires 2 chunks total
-                // Use static helper
                 var testData = FileDownloaderTestHelper.GenerateTestData(fileSize);
-                // Use static helper constant
                 int existingSize = (int)(FileDownloaderTestHelper.DefaultTestChunkSize / 2); // Partial file exists
                 var existingData = testData.Take(existingSize).ToArray();
                 await File.WriteAllBytesAsync(uniqueTestFilePath, existingData);
@@ -153,7 +129,6 @@ namespace ReliableDownloader.Tests
                     long currentRangeFrom = rangeFrom; // Capture loop variables
                     long currentRangeTo = rangeTo;
                     _context.MockWebCalls.Setup(w => w.DownloadPartialContentAsync(url, currentRangeFrom, currentRangeTo, _context.Cts.Token))
-                                 // Use static helper
                                  .Returns(() => Task.FromResult(FileDownloaderTestHelper.CreatePartialContentResponse(testData, currentRangeFrom, currentRangeTo)));
                     currentPos += bytesToDownload;
                     expectedCalls++;
