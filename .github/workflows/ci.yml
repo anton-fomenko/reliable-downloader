@@ -1,29 +1,35 @@
-name: .NET CI
+name: .NET Core CI
 
 on:
   push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+    branches:
+      - main
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./dot-net
 
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v3
-      with:
-        global-json-file: 'dot-net/global.json'
-    
-    - name: Restore dependencies
-      run: dotnet restore dot-net/ReliableDownloader.sln
-    
-    - name: Build
-      run: dotnet build dot-net/ReliableDownloader.sln --no-restore
-    
-    - name: Test
-      run: dotnet test dot-net/ReliableDownloader.sln --no-build --verbosity normal
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          # You can specify a .NET version here if needed, e.g., '6.0.x'
+          # Or, if you have a global.json file, you can point to it:
+          # global-json-file: dot-net/global.json 
+          dotnet-version: '8.0.x' # Using a recent LTS version as an example
+
+      - name: Restore dependencies
+        run: dotnet restore ReliableDownloader.sln
+
+      - name: Build project
+        run: dotnet build ReliableDownloader.sln --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test ReliableDownloader.sln --no-build --configuration Release --verbosity normal
