@@ -47,11 +47,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: TestResults/**/*.trx
+          path: TestResults/**/*.trx 
 
       - name: Publish code coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
         with:
-          files: TestResults/**/coverage.cobertura.xml
+          files: TestResults/**/coverage.cobertura.xml  
           fail_ci_if_error: false
+
