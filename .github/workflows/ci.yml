@@ -32,13 +32,4 @@ jobs:
         run: dotnet build ReliableDownloader.sln --configuration Release --no-restore
 
       - name: Run tests
-        run: dotnet test ReliableDownloader.sln --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
-
-      - name: Report test results
-        uses: dorny/test-reporter@v1
-        if: always() # Ensures this step runs even if prior steps fail (e.g., tests fail)
-        with:
-          name: Test Results # Name of the check run
-          path: dot-net/test-results.trx # Path to the TRX file
-          reporter: dotnet-trx # Format of the results
-          fail-on-error: 'true' # The check will fail if tests fail
+        run: dotnet test ReliableDownloader.sln --no-build --configuration Release --verbosity normal
