@@ -2,70 +2,27 @@ name: .NET CI
 
 on:
   push:
-    branches: [ trunk, main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ trunk, main, master ]
-  workflow_dispatch:
+    branches: [ main ]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      packages: read
-      statuses: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
-          restore-keys: |
-            ${{ runner.os }}-nuget-
-
-      - name: Restore & Build library
-        run: |
-          dotnet restore dot-net/ReliableDownloader/ReliableDownloader.csproj
-          dotnet build dot-net/ReliableDownloader/ReliableDownloader.csproj --configuration Release --no-restore
-
-      - name: Test with coverage (TRX + Cobertura)
-        run: |
-          dotnet test dot-net/ReliableDownloader.Tests/ReliableDownloader.Tests.csproj \
-            --configuration Release \
-            --collect:"XPlat Code Coverage" \
-            --logger trx \
-            --results-directory TestResults \
-            --no-build
-
-      - name: Upload test results artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: TestResults/**/*.trx
-
-      - name: Publish rich test report in PR
-        if: always()
-        uses: dorny/test-reporter@v1
-        with:
-          name: Test Report
-          path: TestResults/**/*.trx
-          reporter: dotnet-trx
-          fail-on-error: false
-
-      - name: Publish code coverage to Codecov
-        if: always()
-        uses: codecov/codecov-action@v4
-        with:
-          files: TestResults/**/coverage.cobertura.xml
-          fail_ci_if_error: false
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        global-json-file: 'dot-net/global.json'
+    
+    - name: Restore dependencies
+      run: dotnet restore dot-net/ReliableDownloader.sln
+    
+    - name: Build
+      run: dotnet build dot-net/ReliableDownloader.sln --no-restore
+    
+    - name: Test
+      run: dotnet test dot-net/ReliableDownloader.sln --no-build --verbosity normal
