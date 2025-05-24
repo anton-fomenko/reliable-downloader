@@ -2,10 +2,10 @@ name: .NET CI
 
 on:
   push:
-    branches: [ trunk ] 
+    branches: [ trunk, main, master ]
   pull_request:
-    branches: [ trunk ]
-  workflow_dispatch:  
+    branches: [ trunk, main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -33,27 +33,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nuget-
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Build
-        run: dotnet build --configuration Release --no-restore
+      - name: Restore & Build library
+        run: |
+          dotnet restore dot-net/ReliableDownloader/ReliableDownloader.csproj
+          dotnet build dot-net/ReliableDownloader/ReliableDownloader.csproj --configuration Release --no-restore
 
       - name: Test with coverage
         run: |
-          dotnet test --configuration Release --no-build --collect:"XPlat Code Coverage"
+          dotnet test dot-net/ReliableDownloader.Tests/ReliableDownloader.Tests.csproj --configuration Release --collect:"XPlat Code Coverage" --logger trx --results-directory TestResults --no-build
 
-      - name: Publish test results
+      - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: |
-            **/TestResults/**/*.trx
+          path: TestResults/**/*.trx
 
-      - name: Publish code coverage
+      - name: Publish code coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
         with:
-          files: ${{ github.workspace }}/**/TestResults/**/coverage.cobertura.xml
+          files: TestResults/**/coverage.cobertura.xml
           fail_ci_if_error: false
