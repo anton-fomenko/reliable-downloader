@@ -49,6 +49,15 @@ jobs:
           name: test-results
           path: TestResults/**/*.trx 
 
+      - name: Debug File Paths
+        if: always()
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Workspace contents:"
+          ls -R ${{ github.workspace }}
+          echo "Looking for TestResults in ${{ github.workspace }}/TestResults:"
+          ls -R ${{ github.workspace }}/TestResults || echo "TestResults directory not found or empty."
+
       - name: Test Report
         if: always()
         uses: dorny/test-reporter@v1
