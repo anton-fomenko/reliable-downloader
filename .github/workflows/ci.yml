@@ -38,30 +38,34 @@ jobs:
           dotnet restore dot-net/ReliableDownloader/ReliableDownloader.csproj
           dotnet build dot-net/ReliableDownloader/ReliableDownloader.csproj --configuration Release --no-restore
 
-      - name: Test with coverage
+      - name: Test with coverage (TRX + Cobertura)
         run: |
-          dotnet test dot-net/ReliableDownloader.Tests/ReliableDownloader.Tests.csproj --configuration Release --collect:"XPlat Code Coverage" --logger trx --results-directory TestResults --no-build
+          dotnet test dot-net/ReliableDownloader.Tests/ReliableDownloader.Tests.csproj \
+            --configuration Release \
+            --collect:"XPlat Code Coverage" \
+            --logger trx \
+            --results-directory TestResults \
+            --no-build
 
-      - name: Upload test results
+      - name: Upload test results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: dot-net/ReliableDownloader.Tests/TestResults/**/*.trx 
+          path: TestResults/**/*.trx
 
-      - name: Test Report
+      - name: Publish rich test report in PR
         if: always()
         uses: dorny/test-reporter@v1
         with:
           name: Test Report
-          path: ${{ github.workspace }}/dot-net/ReliableDownloader.Tests/TestResults/**/*.trx
+          path: TestResults/**/*.trx
           reporter: dotnet-trx
-          fail-on-error: 'false'
+          fail-on-error: false
 
       - name: Publish code coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
         with:
-          files: dot-net/ReliableDownloader.Tests/TestResults/**/coverage.cobertura.xml  
+          files: TestResults/**/coverage.cobertura.xml
           fail_ci_if_error: false
-
