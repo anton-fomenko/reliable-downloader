@@ -3,8 +3,9 @@ name: .NET CI
 on:
   push:
     branches: [ trunk ] 
+  pull_request:
     branches: [ trunk ]
-  workflow_dispatch:
+  workflow_dispatch:  
 
 jobs:
   build:
