@@ -49,6 +49,15 @@ jobs:
           name: test-results
           path: TestResults/**/*.trx 
 
+      - name: Test Report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Test Report
+          path: TestResults/**/*.trx
+          reporter: dotnet-trx
+          fail-on-error: 'false'
+
       - name: Publish code coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
